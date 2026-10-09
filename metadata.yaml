@@ -1,8 +1,41 @@
 name: astrbot_plugin_github_star_notifier # 插件唯一识别名
 display_name: GitHub 仓库动态推送 # 插件展示名
-desc: 监控 GitHub 仓库的 Star、Fork 与提交记录，出现新动态时自动推送到 QQ 群等会话。
-short_desc: GitHub 仓库 Star / Fork / 提交动态推送
-version: v1.0.0
-author: akexin
-repo: https://github.com/akexin/astrbot_plugin_github_star_notifier
-astrbot_version: ">=4.0.0"
+short_desc: 监控 GitHub 仓库的 Star / Fork / 提交动态，并推送到 QQ 群
+desc: |-
+  监控一个或多个 GitHub 仓库的 Star、Fork 与提交记录，出现新动态时自动推送到指定的 QQ 群或其他会话。
+
+  · 基于轮询 GitHub REST API 实现，无需公网 IP、域名或反向代理，开箱即用
+  · 新 Star 推送可列出具体用户，并可选附带用户头像
+  · 可选推送新 Fork 与新提交记录（可限制每次展示条数）
+  · 支持消息模板自定义、@全体成员、多仓库并行监控
+  · 提供 /ghstar 指令进行可视化管理（增删仓库、订阅会话、立即检查、发送测试）
+  · 状态持久化于 data/plugin_data/，插件更新不丢失
+version: v1.0.0 # 插件版本号
+author: akexin # 作者
+repo: https://github.com/akexin/astrbot_plugin_github_star_notifier # 插件仓库地址
+astrbot_version: ">=4.17.0,<5" # 依赖 astrbot.api.event.MessageChain 等 v4 稳定 API
+support_platforms: # 支持主动消息推送的平台适配器（不含 qq_official 系列，见 README）
+  - aiocqhttp
+  - telegram
+  - discord
+  - slack
+  - lark
+  - dingtalk
+  - kook
+  - satori
+  - matrix
+  - misskey
+  - line
+  - vocechat
+  - wecom
+  - wecom_ai_bot
+  - weixin_oc
+  - weixin_official_account
+  - mattermost
+tags: # 插件市场分类与搜索标签
+  - github
+  - notification
+  - star
+  - qq
+  - tools
+social_link: https://github.com/akexin # 作者主页

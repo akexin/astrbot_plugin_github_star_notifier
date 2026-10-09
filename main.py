@@ -23,13 +23,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
-
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import AtAll, Image, Plain
@@ -112,10 +112,8 @@ class GithubStarNotifier(Star):
         """插件被禁用或重载时清理后台任务与网络连接。"""
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._task = None
 
         if self._session and not self._session.closed:
@@ -395,9 +393,7 @@ class GithubStarNotifier(Star):
         if not new_commits or not self._conf_bool("notify_commit"):
             return
 
-        text = self._render_commit_message(
-            full_name, branch, html_url, new_commits[:limit]
-        )
+        text = self._render_commit_message(full_name, branch, html_url, new_commits[:limit])
         await self._broadcast(lambda t=text: self._build_chain(t))
 
     # ------------------------------------------------------------------ #
@@ -428,9 +424,7 @@ class GithubStarNotifier(Star):
             headers["Authorization"] = f"Bearer {token}"
 
         try:
-            async with session.get(
-                f"{API_BASE}{path}", params=params, headers=headers
-            ) as resp:
+            async with session.get(f"{API_BASE}{path}", params=params, headers=headers) as resp:
                 if resp.status == 404:
                     logger.warning(f"[{PLUGIN_NAME}] 资源不存在（404）：{path}")
                     return None
@@ -442,9 +436,7 @@ class GithubStarNotifier(Star):
                     )
                     return None
                 if resp.status >= 400:
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] GitHub API 返回 HTTP {resp.status}：{path}"
-                    )
+                    logger.warning(f"[{PLUGIN_NAME}] GitHub API 返回 HTTP {resp.status}：{path}")
                     return None
                 return await resp.json()
         except asyncio.CancelledError:
@@ -453,9 +445,7 @@ class GithubStarNotifier(Star):
             logger.warning(f"[{PLUGIN_NAME}] 请求 GitHub 失败（{path}）：{exc}")
             return None
 
-    async def _fetch_latest_stargazers(
-        self, repo: str, total: int, delta: int
-    ) -> list[dict]:
+    async def _fetch_latest_stargazers(self, repo: str, total: int, delta: int) -> list[dict]:
         """取「最新一页」stargazers，从中截取最近新增的用户。
 
         GitHub 的 stargazers 列表按时间升序返回，因此最新加入的用户位于最后一页。
@@ -480,9 +470,7 @@ class GithubStarNotifier(Star):
                 continue
             login = user.get("login")
             if login:
-                users.append(
-                    {"login": login, "avatar": user.get("avatar_url") or ""}
-                )
+                users.append({"login": login, "avatar": user.get("avatar_url") or ""})
         users.reverse()  # 最新的排在前面
         return users
 
@@ -559,9 +547,7 @@ class GithubStarNotifier(Star):
             url=url,
         )
 
-    def _render_commit_message(
-        self, repo: str, branch: str, url: str, commits: list[dict]
-    ) -> str:
+    def _render_commit_message(self, repo: str, branch: str, url: str, commits: list[dict]) -> str:
         lines: list[str] = []
         for item in commits:
             commit = item.get("commit") or {}
@@ -674,9 +660,7 @@ class GithubStarNotifier(Star):
 
         if sub in ("test", "测试"):
             count = await self._broadcast(
-                lambda: self._build_chain(
-                    "🔔 这是一条来自 GitHub Star 推送插件的测试消息。"
-                )
+                lambda: self._build_chain("🔔 这是一条来自 GitHub Star 推送插件的测试消息。")
             )
             yield event.plain_result(f"已向 {count} 个会话发送测试消息。")
             return
@@ -788,20 +772,24 @@ class GithubStarNotifier(Star):
         repos = self._get_repos()
         sessions = self._get_sessions()
         lines = ["📋 GitHub 推送插件状态"]
-        lines.append(f"运行状态：{'✅ 已启用' if self._conf_bool('enabled', True) else '⛔ 已停用'}")
+        lines.append(
+            f"运行状态：{'✅ 已启用' if self._conf_bool('enabled', True) else '⛔ 已停用'}"
+        )
         lines.append(f"轮询间隔：{self._poll_interval()} 秒")
-        lines.append(f"推送开关：Star {'开' if self._conf_bool('notify_star', True) else '关'} / "
-                     f"Fork {'开' if self._conf_bool('notify_fork') else '关'} / "
-                     f"提交 {'开' if self._conf_bool('notify_commit') else '关'}")
-        lines.append(f"GitHub Token：{'已配置' if self._conf_str('github_token') else '未配置（速率受限）'}")
+        lines.append(
+            f"推送开关：Star {'开' if self._conf_bool('notify_star', True) else '关'} / "
+            f"Fork {'开' if self._conf_bool('notify_fork') else '关'} / "
+            f"提交 {'开' if self._conf_bool('notify_commit') else '关'}"
+        )
+        lines.append(
+            f"GitHub Token：{'已配置' if self._conf_str('github_token') else '未配置（速率受限）'}"
+        )
         lines.append("")
         if repos:
             lines.append(f"监控仓库（{len(repos)}）：")
             for repo in repos:
                 record = self._state["repos"].get(repo, {})
-                star_text = (
-                    f"Star {record['stars']}" if "stars" in record else "尚未建立基线"
-                )
+                star_text = f"Star {record['stars']}" if "stars" in record else "尚未建立基线"
                 lines.append(f"  · {repo}（{star_text}）")
         else:
             lines.append("监控仓库：无，请使用 /ghstar add owner/repo 添加。")

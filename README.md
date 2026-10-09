@@ -1,8 +1,15 @@
 # astrbot_plugin_github_star_notifier
 
+<img src="logo.png" width="120" alt="logo" align="right" />
+
 > 监控 GitHub 仓库的 **Star / Fork / 提交记录**，一旦出现新动态，立即推送提醒到指定的 QQ 群或其他会话。
 
-适用于 AstrBot v4.x。
+![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.17.0%2C%20%3C5-5865F2)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-%3E%3D3.10-blue)
+![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)
+
+**版本要求**：AstrBot `>=4.17.0, <5`　|　**主要平台**：OneBot（NapCat / Lagrange）接入的 QQ 群
 
 ---
 
@@ -35,9 +42,41 @@ data/plugins/astrbot_plugin_github_star_notifier/
 ├── metadata.yaml        # 插件元数据
 ├── _conf_schema.json    # 配置面板 Schema
 ├── requirements.txt     # 依赖（aiohttp）
+├── logo.png             # 插件图标（256×256）
+├── ruff.toml            # 代码风格配置
 ├── README.md
-└── logo.png             # 可选，插件图标（1:1，推荐 256x256）
+├── LICENSE              # MIT
+└── .gitignore
 ```
+
+---
+
+## 🧩 兼容性
+
+### AstrBot 版本
+
+`astrbot_version: ">=4.17.0,<5"`
+
+本插件依赖下列在 AstrBot v4.17 起稳定提供的接口：
+
+| 接口 | 用途 |
+| --- | --- |
+| `astrbot.api.event.MessageChain` | 构造推送消息链 |
+| `astrbot.api.star.Context.send_message()` | 主动消息推送 |
+| `astrbot.api.event.filter` | 指令与权限装饰器 |
+| `astrbot.core.utils.astrbot_path.get_astrbot_plugin_data_path()` | 数据持久化目录 |
+
+### 支持的平台适配器
+
+| 平台适配器 | 是否声明支持 | 说明 |
+| --- | :---: | --- |
+| `aiocqhttp` | ✅ | **推荐**，NapCat / Lagrange 接入 QQ，主动推送稳定 |
+| `telegram` / `discord` / `slack` / `lark` / `dingtalk` / `kook` | ✅ | 支持主动消息 |
+| `satori` / `matrix` / `misskey` / `line` / `vocechat` / `mattermost` | ✅ | 支持主动消息 |
+| `wecom` / `wecom_ai_bot` / `weixin_oc` / `weixin_official_account` | ✅ | 支持主动消息（具体能力视平台策略） |
+| `qq_official` / `qq_official_webhook` | ❌ | **未声明**：AstrBot 的 `Context.send_message()` 在这两个适配器上不可用，插件无法主动推送 |
+
+> 判定标准：凡实现 `send_by_session()` 主动发送能力的适配器均予声明；QQ 官方机器人 API 按 AstrBot 官方说明不支持主动消息，故排除。
 
 ---
 
@@ -165,6 +204,22 @@ QQ 官方机器人平台不支持 AstrBot 的主动消息接口，请改用 NapC
 
 **Q：如何只看提交，不看 Star？**
 关闭 `notify_star`，开启 `notify_commit`。
+
+---
+
+## ✅ 开发原则遵循情况
+
+对照 [AstrBot 插件开发指南](https://docs.astrbot.app/dev/star/plugin-new.html) 的开发原则：
+
+| 原则 | 落实情况 |
+| --- | --- |
+| 功能需经过测试 | 已编写离线测试（桩替 AstrBot / aiohttp），覆盖仓库名解析、消息渲染、模板回退、消息链构建、基线建立与 Star/Fork/提交三类推送、订阅持久化、无目标降级、生命周期初始化与销毁，全部断言通过 |
+| 需包含良好的注释 | 主程序含模块级说明、分区注释与逐方法 docstring |
+| 持久化数据存于 `data` 目录 | 状态写入 `data/plugin_data/astrbot_plugin_github_star_notifier/state.json`，并采用「临时文件 + `os.replace`」原子写入 |
+| 良好的错误处理机制 | 网络请求、JSON 解析、模板渲染、消息发送均有兜底；单仓库异常不影响其余仓库；插件不会因单次错误崩溃 |
+| 提交前使用 `ruff` 格式化 | 已配置 `ruff.toml` 并通过 `ruff format` + `ruff check`（select E/W/F/I/UP/B/C4/SIM） |
+| 不使用 `requests`，改用异步网络库 | 全程使用 `aiohttp` 异步请求，共享单个 `ClientSession` |
+| 避免提交无关文件 | 提供 `.gitignore` 排除 `__pycache__`、`data/`、`.venv`、IDE 配置等，发布包体积 < 16MB |
 
 ---
 
