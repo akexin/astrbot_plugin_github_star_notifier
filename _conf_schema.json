@@ -1,0 +1,109 @@
+{
+  "enabled": {
+    "description": "启用后台轮询",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不再请求 GitHub，仅保留指令功能。"
+  },
+  "repositories": {
+    "description": "监控的 GitHub 仓库列表",
+    "type": "list",
+    "default": [],
+    "hint": "每项填写 owner/repo，例如 Soulter/astrbot；也可以在群内用 /ghstar add owner/repo 添加。"
+  },
+  "github_token": {
+    "description": "GitHub 个人访问令牌（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "填写后 API 速率上限由 60 次/小时提升至 5000 次/小时。公开仓库只需勾选 public_repo 权限即可，建议使用 Fine-grained Token 并仅授予只读权限。"
+  },
+  "poll_interval": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "slider": {
+      "min": 60,
+      "max": 3600,
+      "step": 30
+    },
+    "hint": "间隔越短越实时，但请求次数越多。建议 300 秒以上。"
+  },
+  "notify_star": {
+    "description": "推送新的 Star",
+    "type": "bool",
+    "default": true
+  },
+  "notify_fork": {
+    "description": "推送新的 Fork",
+    "type": "bool",
+    "default": false
+  },
+  "notify_commit": {
+    "description": "推送新的提交记录（仓库更新）",
+    "type": "bool",
+    "default": false
+  },
+  "max_commits_per_push": {
+    "description": "每次最多推送的提交条数",
+    "type": "int",
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "branch": {
+    "description": "监控的分支",
+    "type": "string",
+    "default": "",
+    "hint": "留空表示使用仓库的默认分支。"
+  },
+  "notify_on_first_run": {
+    "description": "首次监控时也推送一次概览",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，避免添加仓库时立刻被历史数据刷屏。"
+  },
+  "mention_all": {
+    "description": "推送时 @全体成员",
+    "type": "bool",
+    "default": false
+  },
+  "send_avatar": {
+    "description": "推送新 Star 时附带用户头像图片",
+    "type": "bool",
+    "default": false
+  },
+  "allow_member_subscribe": {
+    "description": "允许群成员自行订阅/退订",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时仅 AstrBot 管理员可使用 /ghsub 与 /ghunsub。"
+  },
+  "target_sessions": {
+    "description": "推送目标会话列表（高级）",
+    "type": "list",
+    "default": [],
+    "hint": "会话统一标识（unified_msg_origin），形如 aiocqhttp:GroupMessage:123456789。一般无需手填，在群内使用 /ghstar sub 即可自动添加。"
+  },
+  "star_message_template": {
+    "description": "Star 推送消息模板",
+    "type": "text",
+    "default": "🌟 新的 Star！\n\n仓库：{repo}\n用户：{user}\nStar 总数：{star_count}（+{delta}）\n时间：{time}\n{url}",
+    "hint": "可用占位符：{repo} {user} {star_count} {delta} {user_count} {time} {url}"
+  },
+  "fork_message_template": {
+    "description": "Fork 推送消息模板",
+    "type": "text",
+    "default": "🍴 新的 Fork！\n\n仓库：{repo}\n用户：{user}\nFork 总数：{fork_count}（+{delta}）\n时间：{time}\n{url}",
+    "hint": "可用占位符：{repo} {user} {fork_count} {delta} {user_count} {time} {url}"
+  },
+  "commit_message_template": {
+    "description": "提交推送消息模板",
+    "type": "text",
+    "default": "📦 仓库更新\n\n仓库：{repo}\n分支：{branch}\n新增 {count} 次提交：\n{commits}\n时间：{time}\n{url}",
+    "hint": "可用占位符：{repo} {branch} {count} {commits} {time} {url}"
+  }
+}

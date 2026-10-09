@@ -1,0 +1,8 @@
+name: astrbot_plugin_github_star_notifier # 插件唯一识别名
+display_name: GitHub 仓库动态推送 # 插件展示名
+desc: 监控 GitHub 仓库的 Star、Fork 与提交记录，出现新动态时自动推送到 QQ 群等会话。
+short_desc: GitHub 仓库 Star / Fork / 提交动态推送
+version: v1.0.0
+author: akexin
+repo: https://github.com/akexin/astrbot_plugin_github_star_notifier
+astrbot_version: ">=4.0.0"
