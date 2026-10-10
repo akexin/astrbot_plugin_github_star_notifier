@@ -9,7 +9,7 @@
     "description": "监控的 GitHub 仓库列表",
     "type": "list",
     "default": [],
-    "hint": "每项填写 owner/repo，例如 Soulter/astrbot；也可以在群内用 /ghstar add owner/repo 添加。"
+    "hint": "每项填写 owner/repo，例如 akexin/astrbot_plugin_github_star_notifier；也可以在群内用 /ghstar add owner/repo 添加（会自动校验仓库是否存在）。"
   },
   "github_token": {
     "description": "GitHub 个人访问令牌（可选）",
@@ -21,13 +21,13 @@
   "poll_interval": {
     "description": "轮询间隔（秒）",
     "type": "int",
-    "default": 300,
+    "default": 120,
     "slider": {
-      "min": 60,
+      "min": 30,
       "max": 3600,
       "step": 30
     },
-    "hint": "间隔越短越实时，但请求次数越多。建议 300 秒以上。"
+    "hint": "间隔越短越实时，请求次数也越多。默认 120 秒，最小 30 秒。"
   },
   "notify_star": {
     "description": "推送新的 Star",
@@ -61,10 +61,16 @@
     "hint": "留空表示使用仓库的默认分支。"
   },
   "notify_on_first_run": {
-    "description": "首次监控时也推送一次概览",
+    "description": "添加仓库后推送一条「已开始监控」概览",
     "type": "bool",
-    "default": false,
-    "hint": "默认关闭，避免添加仓库时立刻被历史数据刷屏。"
+    "default": true,
+    "hint": "建议保持开启：添加仓库时立即推送当前 Star/Fork 数，可当场确认推送链路是否打通。此处只推一条概览，不会回放历史 Star 记录。"
+  },
+  "fetch_stargazer_details": {
+    "description": "尝试获取新增 Star 的具体用户名",
+    "type": "bool",
+    "default": true,
+    "hint": "GitHub 自 2026-07 起将 /stargazers 端点限制为「仅仓库管理员与协作者可访问」，监控他人仓库时该请求会失败并自动降级为「+N 位用户」（失败后不再重复请求，避免浪费额度）。Star 数量与增量推送不受影响。"
   },
   "mention_all": {
     "description": "推送时 @全体成员",
@@ -74,7 +80,8 @@
   "send_avatar": {
     "description": "推送新 Star 时附带用户头像图片",
     "type": "bool",
-    "default": false
+    "default": false,
+    "hint": "仅在成功获取到 Star 用户名与头像时生效。"
   },
   "allow_member_subscribe": {
     "description": "允许群成员自行订阅/退订",

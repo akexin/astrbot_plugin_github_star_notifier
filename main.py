@@ -14,10 +14,25 @@
 （AstrBot 的 ``register_web_api`` 注册的路由挂在管理面板下且需要鉴权，
 无法直接接收 GitHub Webhook 推送，故未采用 Webhook 方案。）
 
+增量判定（v1.0.1 起的关键设计）
+-------------------------------
+Star / Fork 的「新增数量」**只依赖** ``GET /repos/{owner}/{repo}`` 返回的
+``stargazers_count`` 与 ``forks_count``。这两个字段至今仍然公开可用。
+
+而「列出具体是谁点了 Star」所依赖的 ``/repos/{owner}/{repo}/stargazers``
+已被 GitHub 收紧：据官方 changelog（2026-06-30）与官方文档，该端点自
+**2026 年 7 月** 起 **仅仓库管理员与协作者可访问**，其他人会收到
+403 / 404（匿名请求为 401）。
+
+因此本插件把用户名列表视为**可选增强**：能取到就列名字，取不到就只报
+「+N 位用户」，并且一旦确认不可用就停止重复请求，避免浪费 API 额度。
+**推送本身永远不会因为该限制而失效。**
+
 数据持久化
 ----------
 状态文件保存在 ``data/plugin_data/astrbot_plugin_github_star_notifier/state.json``，
-存放订阅会话列表与各仓库的 Star/Fork/最新提交基线，插件更新或重装不会丢失。
+存放订阅会话列表、各仓库的 Star/Fork/最新提交基线，以及每次检查的进度
+（检查次数、最近检查时间、最近成功时间、最近错误），插件更新或重装不会丢失。
 """
 
 from __future__ import annotations
@@ -37,11 +52,12 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 PLUGIN_NAME = "astrbot_plugin_github_star_notifier"
+PLUGIN_VERSION = "v1.0.1"
 API_BASE = "https://api.github.com"
 CST = timezone(timedelta(hours=8))
 
 STARGAZER_PAGE_SIZE = 100
-"""stargazers 接口单页容量，用于定位「最新一页」。"""
+"""stargazers 接口单页容量。接口按 ``starred_at`` 升序返回，最新在最后一页。"""
 
 MAX_NAMED_USERS = 20
 """单条推送消息中最多列出多少个用户名，超出以「等 N 位用户」概括。"""
@@ -76,7 +92,7 @@ DEFAULT_COMMIT_TEMPLATE = """📦 仓库更新
     PLUGIN_NAME,
     "akexin",
     "监控 GitHub 仓库的 Star / Fork / 提交动态，并推送到 QQ 群等会话。",
-    "v1.0.0",
+    PLUGIN_VERSION,
     "https://github.com/akexin/astrbot_plugin_github_star_notifier",
 )
 class GithubStarNotifier(Star):
@@ -104,7 +120,7 @@ class GithubStarNotifier(Star):
         self._ensure_session()
         self._task = asyncio.create_task(self._poll_loop())
         logger.info(
-            f"[{PLUGIN_NAME}] 已启动：轮询间隔 {self._poll_interval()} 秒，"
+            f"[{PLUGIN_NAME}] {PLUGIN_VERSION} 已启动：轮询间隔 {self._poll_interval()} 秒，"
             f"监控 {len(self._get_repos())} 个仓库，推送目标 {len(self._get_sessions())} 个会话。"
         )
 
@@ -146,7 +162,7 @@ class GithubStarNotifier(Star):
 
     def _poll_interval(self) -> int:
         """轮询间隔（秒），下限 30 秒以避免过于频繁地请求 GitHub。"""
-        return max(30, self._conf_int("poll_interval", 300))
+        return max(30, self._conf_int("poll_interval", 120))
 
     def _get_repos(self) -> list[str]:
         """从配置读取并规范化待监控仓库列表。"""
@@ -193,7 +209,9 @@ class GithubStarNotifier(Star):
                 break
         if text.endswith(".git"):
             text = text[:-4]
-        parts = [p for p in text.strip("/").split("/") if p]
+        # 逐段 strip，容忍 "owner / repo"、"owner/repo/" 等写法。
+        parts = [p.strip() for p in text.split("/")]
+        parts = [p for p in parts if p]
         if len(parts) < 2:
             return ""
         return f"{parts[0]}/{parts[1]}"
@@ -237,7 +255,7 @@ class GithubStarNotifier(Star):
     # ------------------------------------------------------------------ #
     async def _poll_loop(self) -> None:
         # 稍等片刻，等待 AstrBot 平台适配器就绪。
-        await asyncio.sleep(10)
+        await asyncio.sleep(5)
         while True:
             try:
                 if self._conf_bool("enabled", True):
@@ -248,26 +266,42 @@ class GithubStarNotifier(Star):
                 logger.error(f"[{PLUGIN_NAME}] 轮询过程中出现异常：{exc}", exc_info=True)
             await asyncio.sleep(self._poll_interval())
 
-    async def _check_all(self) -> None:
+    async def _check_all(self) -> list[str]:
+        """检查所有监控仓库，返回每个仓库的一行结果摘要。"""
         repos = self._get_repos()
         if not repos:
-            return
+            return []
+        summaries: list[str] = []
         async with self._check_lock:
             for repo in repos:
                 try:
-                    await self._check_repo(repo)
+                    summaries.append(await self._check_repo(repo))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"[{PLUGIN_NAME}] 检查仓库 {repo} 失败：{exc}")
+                    summaries.append(f"❌ {repo}：{exc}")
                 self._save_state()
                 # 轻微间隔，避免短时间内打满 GitHub 速率限制。
                 await asyncio.sleep(1.2)
+        return summaries
 
-    async def _check_repo(self, repo: str) -> None:
-        info = await self._gh_get(f"/repos/{repo}")
-        if not isinstance(info, dict):
-            return
+    async def _check_repo(self, repo: str, info: dict | None = None) -> str:
+        """检查单个仓库并推进其推送进度，返回一行人类可读的结果摘要。
+
+        ``info`` 若已由调用方取到可直接传入，避免重复请求。
+        """
+        record: dict = self._state["repos"].setdefault(repo, {})
+        record["checks"] = int(record.get("checks") or 0) + 1
+        record["last_check_at"] = self._now()
+
+        if info is None:
+            status, info = await self._request(f"/repos/{repo}")
+            if status != 200 or not isinstance(info, dict):
+                error = self._describe_error(status, f"/repos/{repo}")
+                record["last_error"] = error
+                logger.warning(f"[{PLUGIN_NAME}] {repo} 读取失败：{error}")
+                return f"❌ {repo}：{error}"
 
         stars = int(info.get("stargazers_count") or 0)
         forks = int(info.get("forks_count") or 0)
@@ -275,18 +309,25 @@ class GithubStarNotifier(Star):
         full_name = info.get("full_name") or repo
         html_url = info.get("html_url") or f"https://github.com/{repo}"
 
-        record: dict = self._state["repos"].setdefault(repo, {})
         prev_stars = record.get("stars")
         prev_forks = record.get("forks")
         first_run = prev_stars is None
 
         record["full_name"] = full_name
         record["url"] = html_url
+        record["last_success_at"] = self._now()
+        record["last_error"] = ""
 
         await self._handle_stars(repo, record, first_run, prev_stars, stars, full_name, html_url)
         await self._handle_forks(repo, record, prev_forks, forks, full_name, html_url)
-        await self._handle_commits(repo, record, first_run, default_branch, full_name, html_url)
+        await self._handle_commits(repo, record, default_branch, full_name, html_url)
 
+        tip = "已建立基线" if first_run else "增量检查"
+        return f"✅ {repo}：Star {stars}　Fork {forks}（{tip}）"
+
+    # ------------------------------------------------------------------ #
+    # 各类动态处理
+    # ------------------------------------------------------------------ #
     async def _handle_stars(
         self,
         repo: str,
@@ -299,10 +340,13 @@ class GithubStarNotifier(Star):
     ) -> None:
         if first_run:
             record["stars"] = stars
-            if self._conf_bool("notify_on_first_run") and stars > 0:
+            record["baseline_at"] = self._now()
+            # 首次建立基线时默认推送一条，便于用户当场确认推送链路是否打通。
+            if self._conf_bool("notify_on_first_run", True):
                 text = (
                     f"👀 已开始监控 {full_name}\n"
-                    f"当前 Star 数：{stars}　Fork 数：{record.get('forks', 0)}\n"
+                    f"当前 Star：{stars}　Fork：{record.get('forks', 0)}\n"
+                    f"此后新增 Star 会即时推送到本会话。\n"
                     f"{html_url}"
                 )
                 await self._broadcast(lambda t=text: self._build_chain(t))
@@ -317,13 +361,19 @@ class GithubStarNotifier(Star):
         if not self._conf_bool("notify_star", True):
             return
 
-        users = await self._fetch_latest_stargazers(repo, stars, delta)
-        text = self._render_star_message(full_name, html_url, stars, delta, users)
-        avatars = (
-            [u["avatar"] for u in users if u.get("avatar")]
-            if self._conf_bool("send_avatar")
-            else []
+        users = await self._fetch_latest_stargazers(repo, record, stars, delta)
+        named = self._format_users(users, delta, "位用户")
+        if named:
+            user_text = named
+        elif record.get("star_detail_ok") is False:
+            user_text = f"{delta} 位用户（GitHub 已限制该仓库的 Star 用户列表）"
+        else:
+            user_text = f"{delta} 位用户"
+
+        text = self._render_star_message(
+            full_name, html_url, stars, delta, user_text, len(users) or delta
         )
+        avatars = [u["avatar"] for u in users if u.get("avatar")] if users else []
         await self._broadcast(lambda t=text, a=avatars: self._build_chain(t, a))
 
     async def _handle_forks(
@@ -348,14 +398,16 @@ class GithubStarNotifier(Star):
             return
 
         users = await self._fetch_latest_forks(repo, delta)
-        text = self._render_fork_message(full_name, html_url, forks, delta, users)
+        user_text = self._format_users(users, delta, "个用户") or f"{delta} 个用户"
+        text = self._render_fork_message(
+            full_name, html_url, forks, delta, user_text, len(users) or delta
+        )
         await self._broadcast(lambda t=text: self._build_chain(t))
 
     async def _handle_commits(
         self,
         repo: str,
         record: dict,
-        first_run: bool,
         default_branch: str,
         full_name: str,
         html_url: str,
@@ -403,17 +455,17 @@ class GithubStarNotifier(Star):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=25),
-                headers={"User-Agent": f"AstrBot-{PLUGIN_NAME}/1.0"},
+                headers={"User-Agent": f"AstrBot-{PLUGIN_NAME}/{PLUGIN_VERSION}"},
             )
         return self._session
 
-    async def _gh_get(
+    async def _request(
         self,
         path: str,
         params: dict | None = None,
         accept: str | None = None,
-    ) -> object | None:
-        """发起 GitHub REST 请求，失败时返回 None（不抛出异常）。"""
+    ) -> tuple[int, object | None]:
+        """发起 GitHub REST 请求，返回 ``(HTTP 状态码, JSON)``；网络异常返回 ``(0, None)``。"""
         session = self._ensure_session()
         headers = {
             "Accept": accept or "application/vnd.github+json",
@@ -425,50 +477,98 @@ class GithubStarNotifier(Star):
 
         try:
             async with session.get(f"{API_BASE}{path}", params=params, headers=headers) as resp:
-                if resp.status == 404:
-                    logger.warning(f"[{PLUGIN_NAME}] 资源不存在（404）：{path}")
-                    return None
-                if resp.status in (403, 429):
+                status = resp.status
+                if status == 403:
                     remaining = resp.headers.get("X-RateLimit-Remaining", "?")
                     logger.warning(
-                        f"[{PLUGIN_NAME}] 触发 GitHub API 限流（HTTP {resp.status}，剩余额度 {remaining}）。"
-                        "建议在插件配置中填写 github_token。"
+                        f"[{PLUGIN_NAME}] GitHub 返回 403（{path}，剩余额度 {remaining}）。"
                     )
-                    return None
-                if resp.status >= 400:
-                    logger.warning(f"[{PLUGIN_NAME}] GitHub API 返回 HTTP {resp.status}：{path}")
-                    return None
-                return await resp.json()
+                elif status >= 400:
+                    logger.warning(f"[{PLUGIN_NAME}] GitHub 返回 HTTP {status}：{path}")
+                if status >= 400:
+                    return status, None
+                return status, await resp.json()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[{PLUGIN_NAME}] 请求 GitHub 失败（{path}）：{exc}")
-            return None
+            return 0, None
 
-    async def _fetch_latest_stargazers(self, repo: str, total: int, delta: int) -> list[dict]:
-        """取「最新一页」stargazers，从中截取最近新增的用户。
+    async def _gh_get(
+        self,
+        path: str,
+        params: dict | None = None,
+        accept: str | None = None,
+    ) -> object | None:
+        """仅在成功时返回 JSON，失败统一返回 None。"""
+        _, data = await self._request(path, params=params, accept=accept)
+        return data
 
-        GitHub 的 stargazers 列表按时间升序返回，因此最新加入的用户位于最后一页。
+    @staticmethod
+    def _describe_error(status: int, path: str = "") -> str:
+        """把 HTTP 状态码翻译成用户可读的中文说明。"""
+        if status == 0:
+            return "网络请求失败（无法连接 api.github.com）"
+        if status == 401:
+            return "Token 无效或已过期，请检查 github_token 配置"
+        if status == 403:
+            if "stargazers" in path or "subscribers" in path:
+                return "GitHub 已限制该端点，仅仓库管理员/协作者可访问"
+            return "触发 GitHub 速率限制或 Token 权限不足"
+        if status == 404:
+            if "stargazers" in path or "subscribers" in path:
+                return "GitHub 已限制该端点，仅仓库管理员/协作者可访问"
+            return "仓库不存在，或为私有仓库且 Token 无权访问"
+        if status == 429:
+            return "触发 GitHub 速率限制"
+        return f"GitHub API 返回 HTTP {status}"
+
+    async def _fetch_latest_stargazers(
+        self,
+        repo: str,
+        record: dict,
+        total: int,
+        delta: int,
+    ) -> list[dict]:
+        """取最近新增的 Star 用户，作为推送消息的增强信息。
+
+        ``/stargazers`` 自 2026 年 7 月起仅对仓库管理员与协作者开放，对他人仓库
+        会返回 403/404。此处静默降级：只报「+N 位用户」，并打标记避免反复请求。
+        **Star 增量本身由 ``stargazers_count`` 计算，不受该限制影响。**
         """
+        if not self._conf_bool("fetch_stargazer_details", True):
+            return []
+        if record.get("star_detail_ok") is False:
+            # 已知不可访问，不再浪费额度重复请求。
+            return []
+
         page = max(1, (total + STARGAZER_PAGE_SIZE - 1) // STARGAZER_PAGE_SIZE)
-        data = await self._gh_get(
+        status, data = await self._request(
             f"/repos/{repo}/stargazers",
             params={"per_page": STARGAZER_PAGE_SIZE, "page": page},
             accept="application/vnd.github.star+json",
         )
-        if not isinstance(data, list) or not data:
+        if status != 200 or not isinstance(data, list) or not data:
+            if status in (401, 403, 404):
+                record["star_detail_ok"] = False
+                logger.info(
+                    f"[{PLUGIN_NAME}] {repo} 的 Star 用户列表不可访问（HTTP {status}）："
+                    "GitHub 自 2026-07 起将该端点限制为仓库管理员/协作者。"
+                    "后续推送只显示新增人数。"
+                )
             return []
+        record["star_detail_ok"] = True
 
-        take = min(delta, len(data), MAX_NAMED_USERS)
+        items = [x for x in data if isinstance(x, dict)]
+        # 接口按 starred_at 升序返回，最新在末尾；优先按时间排序，不依赖分页位置。
+        if items and all(x.get("starred_at") for x in items):
+            items = sorted(items, key=lambda x: str(x.get("starred_at")))
+
+        take = min(delta, len(items), MAX_NAMED_USERS)
         users: list[dict] = []
-        for item in data[-take:] if take else []:
-            if isinstance(item, dict) and isinstance(item.get("user"), dict):
-                user = item["user"]
-            elif isinstance(item, dict):
-                user = item
-            else:
-                continue
-            login = user.get("login")
+        for item in items[-take:] if take else []:
+            user = item.get("user") if isinstance(item.get("user"), dict) else item
+            login = (user or {}).get("login")
             if login:
                 users.append({"login": login, "avatar": user.get("avatar_url") or ""})
         users.reverse()  # 最新的排在前面
@@ -513,16 +613,17 @@ class GithubStarNotifier(Star):
         url: str,
         star_count: int,
         delta: int,
-        users: list[dict],
+        user_text: str,
+        user_count: int,
     ) -> str:
         return self._apply_template(
             "star_message_template",
             DEFAULT_STAR_TEMPLATE,
             repo=repo,
-            user=self._format_users(users, delta, "gazers"),
+            user=user_text,
             star_count=star_count,
             delta=delta,
-            user_count=len(users) or delta,
+            user_count=user_count,
             time=self._now(),
             url=url,
         )
@@ -533,16 +634,17 @@ class GithubStarNotifier(Star):
         url: str,
         fork_count: int,
         delta: int,
-        users: list[dict],
+        user_text: str,
+        user_count: int,
     ) -> str:
         return self._apply_template(
             "fork_message_template",
             DEFAULT_FORK_TEMPLATE,
             repo=repo,
-            user=self._format_users(users, delta, "forks"),
+            user=user_text,
             fork_count=fork_count,
             delta=delta,
-            user_count=len(users) or delta,
+            user_count=user_count,
             time=self._now(),
             url=url,
         )
@@ -570,14 +672,14 @@ class GithubStarNotifier(Star):
         )
 
     @staticmethod
-    def _format_users(users: list[dict], delta: int, suffix: str) -> str:
+    def _format_users(users: list[dict], delta: int, unit: str) -> str:
+        """拼接用户名列表；无可用用户名时返回空串，由调用方决定兜底文案。"""
         names = [str(u.get("login") or "").strip() for u in users]
         names = [n for n in names if n]
         if not names:
-            unit = "位用户" if suffix == "gazers" else "个用户"
-            return f"{delta}{unit}" if delta > 1 else "未知用户"
+            return ""
         if delta > len(names):
-            return "、".join(names) + f" 等 {delta} 位用户"
+            return "、".join(names) + f" 等 {delta} {unit}"
         return "、".join(names)
 
     def _build_chain(self, text: str, images: list[str] | None = None) -> MessageChain:
@@ -622,7 +724,7 @@ class GithubStarNotifier(Star):
     async def ghstar(self, event: AstrMessageEvent):
         """GitHub 仓库动态推送管理指令（仅管理员）。
 
-        用法：/ghstar [sub|unsub|add|del|list|check|test|help]
+        用法：/ghstar [sub|unsub|add|del|list|check|diag|test|help]
         """
         args = self._parse_args(event, "ghstar")
         sub = args[0].lower() if args else "help"
@@ -641,7 +743,7 @@ class GithubStarNotifier(Star):
             return
 
         if sub in ("add", "添加"):
-            yield event.plain_result(self._add_repo(rest))
+            yield event.plain_result(await self._add_repo(rest))
             return
 
         if sub in ("del", "remove", "rm", "删除"):
@@ -652,17 +754,32 @@ class GithubStarNotifier(Star):
             yield event.plain_result(self._list_text())
             return
 
+        if sub in ("diag", "诊断"):
+            yield event.plain_result(self._diag_text())
+            return
+
         if sub in ("check", "检查", "刷新"):
             yield event.plain_result("⏳ 正在检查所有监控仓库，请稍候…")
-            await self._check_all()
-            yield event.plain_result("✅ 检查完成。")
+            summaries = await self._check_all()
+            if not summaries:
+                yield event.plain_result("ℹ️ 尚未配置监控仓库，请先使用 /ghstar add owner/repo。")
+                return
+            ok = sum(1 for line in summaries if line.startswith("✅"))
+            yield event.plain_result(
+                "\n".join(summaries) + f"\n\n检查完成：{len(summaries)} 个仓库，{ok} 个正常。"
+            )
             return
 
         if sub in ("test", "测试"):
             count = await self._broadcast(
                 lambda: self._build_chain("🔔 这是一条来自 GitHub Star 推送插件的测试消息。")
             )
-            yield event.plain_result(f"已向 {count} 个会话发送测试消息。")
+            if count:
+                yield event.plain_result(f"已向 {count} 个会话发送测试消息。")
+            else:
+                yield event.plain_result(
+                    "⚠️ 未发送成功：尚未配置推送目标会话。请在目标群聊中发送 /ghstar sub 完成订阅。"
+                )
             return
 
         yield event.plain_result(f"未知子命令：{sub}\n\n{self._help_text()}")
@@ -730,12 +847,13 @@ class GithubStarNotifier(Star):
         self._save_state()
         return "✅ 已取消订阅。" if removed else "ℹ️ 当前会话并未订阅。"
 
-    def _add_repo(self, rest: list[str]) -> str:
+    async def _add_repo(self, rest: list[str]) -> str:
+        """添加监控仓库：先校验仓库是否存在，再立即建立基线并回报。"""
         if not rest:
             return "用法：/ghstar add owner/repo"
         repo = self._normalize_repo(rest[0])
         if not repo:
-            return f"⚠️ 无法解析仓库名：{rest[0]}，请使用 owner/repo 格式。"
+            return f"⚠️ 无法解析仓库名：{rest[0]}，请使用 owner/repo 格式（如 akexin/astrbot_plugin_github_star_notifier）。"
 
         repos = self.config.get("repositories") or []
         if not isinstance(repos, list):
@@ -743,10 +861,19 @@ class GithubStarNotifier(Star):
         if any(self._normalize_repo(str(item)) == repo for item in repos):
             return f"ℹ️ 该仓库已在监控列表中：{repo}"
 
+        # 先探测仓库是否存在，避免把占位符或拼错的仓库名写进配置后静默失效。
+        status, info = await self._request(f"/repos/{repo}")
+        if status != 200 or not isinstance(info, dict):
+            return f"❌ 无法添加 {repo}：{self._describe_error(status, f'/repos/{repo}')}"
+
         repos.append(repo)
         self.config["repositories"] = repos
         self._save_config()
-        return f"✅ 已添加监控仓库：{repo}\n使用 /ghstar check 可立即检查一次。"
+
+        # 立即建立基线（并默认推送一条「已开始监控」），让用户当场看到效果。
+        summary = await self._check_repo(repo, info=info)
+        self._save_state()
+        return f"✅ 已添加监控仓库：{repo}\n{summary}"
 
     def _del_repo(self, rest: list[str]) -> str:
         if not rest:
@@ -768,10 +895,23 @@ class GithubStarNotifier(Star):
         self._save_state()
         return f"✅ 已移除监控仓库：{repo}"
 
+    def _repo_status_line(self, repo: str) -> str:
+        """单行渲染某个仓库的进度状态。"""
+        record = self._state["repos"].get(repo)
+        if not record:
+            return f"  · {repo}（⏳ 等待首次检查）"
+        if record.get("last_error"):
+            return f"  · {repo}（❌ {record['last_error']}）"
+        if "stars" not in record:
+            return f"  · {repo}（⏳ 等待首次检查）"
+        baseline_at = str(record.get("baseline_at") or "")[5:16].replace("-", "/")
+        suffix = f" · 基线 {baseline_at}" if baseline_at else ""
+        return f"  · {repo}（Star {record['stars']}{suffix}）"
+
     def _list_text(self) -> str:
         repos = self._get_repos()
         sessions = self._get_sessions()
-        lines = ["📋 GitHub 推送插件状态"]
+        lines = [f"📋 GitHub 推送插件状态　{PLUGIN_VERSION}"]
         lines.append(
             f"运行状态：{'✅ 已启用' if self._conf_bool('enabled', True) else '⛔ 已停用'}"
         )
@@ -787,19 +927,64 @@ class GithubStarNotifier(Star):
         lines.append("")
         if repos:
             lines.append(f"监控仓库（{len(repos)}）：")
-            for repo in repos:
-                record = self._state["repos"].get(repo, {})
-                star_text = f"Star {record['stars']}" if "stars" in record else "尚未建立基线"
-                lines.append(f"  · {repo}（{star_text}）")
+            lines.extend(self._repo_status_line(repo) for repo in repos)
         else:
             lines.append("监控仓库：无，请使用 /ghstar add owner/repo 添加。")
         lines.append("")
         if sessions:
             lines.append(f"推送目标（{len(sessions)}）：")
-            for umo in sessions:
-                lines.append(f"  · {umo}")
+            lines.extend(f"  · {umo}" for umo in sessions)
         else:
             lines.append("推送目标：无，请使用 /ghstar sub 在当前会话订阅。")
+        return "\n".join(lines)
+
+    def _diag_text(self) -> str:
+        """逐仓库输出推送进度诊断信息。"""
+        repos = self._get_repos()
+        sessions = self._get_sessions()
+        lines = [f"🩺 GitHub 推送插件诊断　{PLUGIN_VERSION}"]
+        lines.append(
+            f"运行状态：{'✅ 已启用' if self._conf_bool('enabled', True) else '⛔ 已停用'}"
+        )
+        lines.append(f"轮询间隔：{self._poll_interval()} 秒")
+        lines.append(
+            f"GitHub Token：{'✅ 已配置' if self._conf_str('github_token') else '⛔ 未配置'}"
+        )
+        lines.append(f"推送目标：{len(sessions)} 个会话")
+        lines.append(f"数据文件：{self.state_file}")
+        lines.append("")
+
+        if not repos:
+            lines.append("监控仓库：无。请使用 /ghstar add owner/repo 添加。")
+            return "\n".join(lines)
+
+        for repo in repos:
+            record = self._state["repos"].get(repo, {})
+            lines.append(f"📦 {repo}")
+            if "stars" in record:
+                lines.append(
+                    f"　基线时间：{record.get('baseline_at') or '未知'}（Star {record['stars']}）"
+                )
+            else:
+                lines.append("　基线时间：—（尚未成功建立基线）")
+            lines.append(
+                f"　最近检查：{record.get('last_check_at') or '—'}"
+                f"（累计 {record.get('checks') or 0} 次）"
+            )
+            lines.append(f"　最近成功：{record.get('last_success_at') or '—'}")
+            if record.get("last_error"):
+                lines.append(f"　最近错误：❌ {record['last_error']}")
+
+            detail = record.get("star_detail_ok")
+            if detail is True:
+                lines.append("　Star 用户列表：✅ 可访问")
+            elif detail is False:
+                lines.append("　Star 用户列表：⛔ 不可访问（GitHub 2026-07 起限制为管理员/协作者）")
+            else:
+                lines.append("　Star 用户列表：— 尚未请求")
+            lines.append("")
+
+        lines.append("提示：如需重试 Star 用户列表，先 /ghstar del 再 /ghstar add 即可重置标记。")
         return "\n".join(lines)
 
     @staticmethod
@@ -810,10 +995,11 @@ class GithubStarNotifier(Star):
             "管理员指令：\n"
             "/ghstar sub　　　在当前会话订阅推送\n"
             "/ghstar unsub　　取消当前会话订阅\n"
-            "/ghstar add owner/repo　添加监控仓库\n"
+            "/ghstar add owner/repo　添加监控仓库（立即校验并建立基线）\n"
             "/ghstar del owner/repo　移除监控仓库\n"
             "/ghstar list　　 查看当前状态\n"
             "/ghstar check　　立即检查一次\n"
+            "/ghstar diag　　 查看推送进度诊断\n"
             "/ghstar test　　 发送测试消息\n"
             "/ghstar help　　 显示本帮助\n"
             "\n"

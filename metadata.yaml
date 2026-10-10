@@ -8,9 +8,14 @@ desc: |-
   · 新 Star 推送可列出具体用户，并可选附带用户头像
   · 可选推送新 Fork 与新提交记录（可限制每次展示条数）
   · 支持消息模板自定义、@全体成员、多仓库并行监控
-  · 提供 /ghstar 指令进行可视化管理（增删仓库、订阅会话、立即检查、发送测试）
-  · 状态持久化于 data/plugin_data/，插件更新不丢失
-version: v1.0.0 # 插件版本号
+  · 提供 /ghstar 指令进行可视化管理（增删仓库、订阅会话、立即检查、发送测试、进度诊断）
+  · 添加仓库时自动校验仓库是否存在并立即建立基线，避免填错后静默失效
+  · 状态持久化于 data/plugin_data/，记录每次检查进度，插件更新不丢失
+
+  说明：GitHub 自 2026 年 7 月起将 /stargazers 端点限制为「仅仓库管理员与
+  协作者可访问」。监控他人仓库时插件会自动降级为「+N 位用户」，星标数量与
+  增量推送不受影响。
+version: v1.0.1 # 插件版本号
 author: akexin # 作者
 repo: https://github.com/akexin/astrbot_plugin_github_star_notifier # 插件仓库地址
 astrbot_version: ">=4.17.0,<5" # 依赖 astrbot.api.event.MessageChain 等 v4 稳定 API
