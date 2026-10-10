@@ -9,7 +9,7 @@
 ![Python](https://img.shields.io/badge/Python-%3E%3D3.10-blue)
 ![Ruff](https://img.shields.io/badge/code%20style-ruff-000000)
 
-**版本要求**：AstrBot `>=4.17.0, <5`　|　**当前版本**：`v1.0.1`　|　**主要平台**：OneBot（NapCat / Lagrange）接入的 QQ 群
+**版本要求**：AstrBot `>=4.17.0, <5`　|　**当前版本**：`v1.0.2`　|　**主要平台**：OneBot（NapCat / Lagrange）接入的 QQ 群
 
 ---
 
@@ -23,8 +23,11 @@
 | 🖼️ 头像附图 | 可选，推送 Star 时附带用户头像 |
 | 📣 @全体成员 | 可选，推送时 At 全体 |
 | 🧩 多仓库并行监控 | 可在配置面板或群内指令中动态增删 |
-| ✅ 仓库自动校验 | `/ghstar add` 会先调用 GitHub API 校验仓库是否存在，避免填错仓库名后静默失效 |
-| 🩺 进度可观测 | `/ghstar diag` 逐仓库展示基线时间、最近检查/成功/错误与端点可用性 |
+| 🌐 网络自检 | `/ghstar add` 会**先检测 GitHub API 连通性**并回报结果（哪个端点、耗时多少），连不上时直接说明原因而不会写坏配置 |
+| 🚀 镜像自动加速 | 直连 `api.github.com` 不通（国内服务器常见）时，自动按序切换镜像，**记住可用端点**复用，并可用 `/ghstar ping` 查看各端点耗时 |
+| 🧠 指令容错 | `/ghstar add` 支持完整链接、多参数、逗号分隔；误把帮助里的 `owner/repo` 示例当作参数时会直接提示，不再发起无效请求 |
+| ✅ 仓库自动校验 | 网络自检通过后调用 GitHub API 校验仓库是否存在，避免填错仓库名后静默失效 |
+| 🩺 进度可观测 | `/ghstar diag` 逐仓库展示基线时间、最近检查/成功/错误、所用端点与端点可用性 |
 | 💾 状态持久化 | 订阅关系与逐仓库推送进度保存在 `data/plugin_data/` 下，更新插件不丢失 |
 | 🔐 Token 支持 | 支持配置 GitHub Token，API 速率上限从 60 次/小时提升到 5000 次/小时 |
 
@@ -46,7 +49,7 @@ data/plugins/astrbot_plugin_github_star_notifier/
 ├── requirements.txt         # 依赖（aiohttp）
 ├── logo.png                 # 插件图标（256×256）
 ├── ruff.toml                # 代码风格配置
-├── tests/test_offline.py    # 离线回归测试（97 项断言）
+├── tests/test_offline.py    # 离线回归测试（170 项断言）
 ├── README.md
 ├── LICENSE                  # MIT
 └── .gitignore
@@ -89,7 +92,11 @@ data/plugins/astrbot_plugin_github_star_notifier/
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | 后台轮询总开关 |
 | `repositories` | list | `[]` | 监控的仓库，每项为 `owner/repo` |
-| `github_token` | string | `""` | GitHub Token（可选，强烈建议配置） |
+| `github_token` | string | `""` | GitHub Token（可选，强烈建议配置）。为防止泄露，**默认只发给官方 `api.github.com`，不会发给第三方镜像** |
+| `auto_mirror` | bool | `true` | 直连失败时自动切换镜像加速 |
+| `github_api_mirrors` | list | 见 `_conf_schema.json` | GitHub API 镜像地址，按顺序尝试（支持前缀式与 `{url}` 模板式两种写法） |
+| `custom_api_base` | string | `""` | 自建反代地址，优先级最高 |
+| `mirror_send_token` | bool | `false` | 是否允许把 Token 发送给第三方镜像（默认关闭） |
 | `poll_interval` | int | `120` | 轮询间隔（秒），最小 30 |
 | `notify_star` | bool | `true` | 推送新的 Star |
 | `notify_fork` | bool | `false` | 推送新的 Fork |
@@ -126,11 +133,12 @@ data/plugins/astrbot_plugin_github_star_notifier/
 | --- | --- |
 | `/ghstar sub` | 在**当前会话**订阅推送（把机器人拉进群后，在群里发一次即可） |
 | `/ghstar unsub` | 取消当前会话订阅 |
-| `/ghstar add owner/repo` | 添加监控仓库：**先校验仓库是否存在**，成功则立即建立基线并回报当前 Star 数 |
+| `/ghstar add owner/repo` | 添加监控仓库：**检测网络 → 校验仓库是否存在 → 建立基线并回报当前 Star 数**。支持直接粘贴完整链接，也支持多参数 |
 | `/ghstar del owner/repo` | 移除监控仓库 |
-| `/ghstar list` | 查看运行状态、监控仓库、推送目标 |
+| `/ghstar list` | 查看运行状态、监控仓库、推送目标、当前 API 端点 |
 | `/ghstar check` | 立即检查一次所有仓库，并逐仓库回报结果 |
-| `/ghstar diag` | 推送进度诊断：基线时间、最近检查/成功/错误、Star 用户列表可用性 |
+| `/ghstar ping` | **检测 GitHub API 连通性**：逐个探测直连与全部镜像，输出耗时并选定当前使用端点 |
+| `/ghstar diag` | 推送进度诊断：基线时间、最近检查/成功/错误、所用端点、Star 用户列表可用性 |
 | `/ghstar test` | 向订阅会话发送一条测试消息 |
 | `/ghstar help` | 显示帮助 |
 
@@ -144,12 +152,27 @@ data/plugins/astrbot_plugin_github_star_notifier/
 ### 快速上手
 
 ```
-/ghstar add akexin/astrbot_plugin_github_star_notifier   # 添加仓库（自动校验 + 立即建立基线）
+/ghstar add akexin/astrbot_plugin_github_star_notifier   # 添加仓库（网络自检 + 校验 + 立即建立基线）
 /ghstar sub                                              # 在当前群订阅推送
+/ghstar ping                                             # 检测 GitHub API 连通性（连不上时先看这条）
 /ghstar diag                                             # 查看推送进度诊断
 ```
 
-> `/ghstar add` 成功后**立即**会推送一条「已开始监控」概览；若仓库名写错或仓库不存在，会直接返回错误而**不会**写入配置，避免出现「加了仓库却永远没有推送」的情况。
+`/ghstar add` 的回执会先给出网络检测结果，例如：
+
+```
+🔍 网络检测：✅ 直连 api.github.com　312 ms
+✅ 已添加监控仓库：akexin/astrbot_plugin_github_star_notifier
+✅ akexin/astrbot_plugin_github_star_notifier：Star 0　Fork 0（已建立基线）
+```
+
+直连不通时会自动切换并在回执里说明：
+
+```
+🔍 网络检测：⚠️ 直连不可用，已自动切换镜像 ✅ gh-proxy.com（镜像）　620 ms
+```
+
+> `/ghstar add` 成功后**立即**会推送一条「已开始监控」概览；若网络不可用或仓库不存在，会直接返回错误而**不会**写入配置，避免出现「加了仓库却永远没有推送」的情况。
 
 ---
 
@@ -195,6 +218,59 @@ AstrBot 插件通过 `context.register_web_api()` 注册的路由位于管理面
 
 ---
 
+## 🌐 连不上 api.github.com？（镜像加速）
+
+部分服务器——尤其是国内主机——**无法访问 `api.github.com`**，报错形如：
+
+```
+❌ 无法添加 xxx/yyy：网络请求失败（直连与镜像均无法连接 GitHub API）
+```
+
+插件为此内置了**多端点自动切换**。请求时按下列顺序逐个尝试：
+
+```
+① 自定义 API 地址（custom_api_base，可选）
+② 直连 https://api.github.com
+③ 镜像（github_api_mirrors，按配置顺序）
+```
+
+- 只要某个端点能返回 **HTTP 业务响应**（含 401/403/404），就认定它可用，并**记住它供后续请求优先使用**，避免每次都先等直连超时；
+- 连接失败（超时 / DNS 失败 / 证书错误）或返回 **5xx**（镜像自身故障）时，自动切换到下一个端点；
+- 全部端点都不可用时，`/ghstar add` 会**拒绝写入配置**并列出尝试过的端点与建议，不会留下一个永远不会推送的坏仓库。
+
+### 镜像写法
+
+| 写法 | 示例 | 说明 |
+| --- | --- | --- |
+| 前缀式 | `https://gh-proxy.com/https://api.github.com` | 直接在镜像地址后拼接接口路径，最常用 |
+| 模板式 | `https://api.allorigins.win/raw?url={url}` | `{url}` 会替换为**完整且已 URL 编码**的目标地址，适合自建反代或通用代理 |
+
+### 内置默认镜像（2026-10-11 实测）
+
+| 镜像 | 实测结果 |
+| --- | --- |
+| `https://gh-proxy.com/https://api.github.com` | ✅ 可用，最快（约 0.25 s） |
+| `https://hk.gh-proxy.com/https://api.github.com` | ✅ 可用（会 302 跳转一次，作为兜底） |
+
+> 镜像均为**第三方服务**，可用性会变化，也可能随时失效。若默认镜像失效，请自行替换：可用 `/ghstar ping` 查看各端点耗时，或在插件配置的「GitHub API 镜像」中增删地址；若有自建反向代理，填入「自定义 API 地址」即可（优先级最高）。
+
+### 🔐 Token 与镜像
+
+**默认不会把 GitHub Token 发送给第三方镜像**（避免个人访问令牌泄露给镜像服务商）。这意味着：
+
+- 走镜像时是**匿名请求**，速率上限为 60 次/小时（走直连且配置了 Token 则为 5000 次/小时）；
+- 若镜像由你**自行搭建**并确认可信，可打开 `mirror_send_token` 让 Token 一并透传，以恢复 5000 次/小时。
+
+### 常用排障流程
+
+```
+/ghstar ping      # ① 看哪个端点可用、耗时多少
+/ghstar diag      # ② 看每个仓库的基线 / 最近错误 / 所用端点
+/ghstar check     # ③ 立即触发一次检查，验证配置
+```
+
+---
+
 ## ⚠️ 速率限制
 
 GitHub REST API 对未认证请求限制为 **60 次/小时**，认证请求为 **5000 次/小时**。
@@ -206,6 +282,8 @@ GitHub REST API 对未认证请求限制为 **60 次/小时**，认证请求为 
 - 有新提交时：额外 1 次请求
 
 即最坏情况约 `3 × 仓库数 × (3600 / 轮询间隔)` 次/小时。默认 120 秒间隔、单仓库时约 90 次/小时。为确保稳定运行，**建议在配置中填写 GitHub Token**。
+
+> 注意：走直连时 Token 生效（5000 次/小时）；**走镜像时默认不发送 Token**（避免泄露），因此受 60 次/小时限制。若默认 120 秒轮询仍频繁触发限流，可适当调大 `poll_interval`，或减少监控仓库数量。
 
 > Token 权限建议：Fine-grained Token，仅授予目标仓库的 **Contents: Read-only** 与 **Metadata: Read-only**；公开仓库使用经典 Token 时只需勾选 `public_repo`。
 
@@ -226,8 +304,20 @@ GitHub REST API 对未认证请求限制为 **60 次/小时**，认证请求为 
 **Q：推送没反应？**
 先执行 `/ghstar diag`，它会逐仓库告诉你：是否已建立基线、上次检查时间、最近一次错误是什么、Star 用户列表是否可用。然后按需排查：① `/ghstar list` 确认推送目标不为空；② `/ghstar test` 测试通道；③ 查看 AstrBot 日志中 `[astrbot_plugin_github_star_notifier]` 前缀的输出；④ 确认平台适配器支持**主动消息**（OneBot / NapCat 支持；QQ 官方机器人 API 不支持 `send_message` 主动推送）。
 
+**Q：添加仓库时报「网络请求失败」？**
+说明服务器连不上 `api.github.com`（国内主机常见）。先执行 `/ghstar ping` 查看直连与各镜像的连通性：
+① 若镜像可用而直连不可用，插件已自动切换，无需处理；
+② 若全部端点都不可用，检查服务器出网/防火墙/代理，或改用自建反代填入「自定义 API 地址」；
+③ 也可以自行往「GitHub API 镜像」里添加你信任的镜像地址（支持前缀式与 `{url}` 模板式）。
+
+**Q：提示「owner/repo 只是帮助里的示例占位符」？**
+说明你把帮助文本里的示例一起敲进去了（例如 `/ghstar add owner/repo akiooo/mcd-save-master`）。插件已能自动跳过占位符并采用后面的真实仓库名；若只发了占位符，请补上真实仓库名，形如 `/ghstar add 用户名/仓库名`。
+
+**Q：`/ghstar add` 支持哪几种写法？**
+`用户名/仓库名`、`https://github.com/用户名/仓库名`、`git@github.com:用户名/仓库名.git` 均可；也可以用逗号分隔或空格分隔一次给多个参数，插件会取第一个有效仓库名并提示忽略了哪些片段。
+
 **Q：添加了仓库，但一直没有推送？**
-最常见的原因是仓库名写错。v1.0.1 起 `/ghstar add` 会先调 API 校验，仓库不存在会直接报错；若你旧版本添加过错误仓库，执行 `/ghstar del 错误仓库名` 后再重新添加即可。另外请注意：**建立基线后只推送「新增」的 Star**，加仓库那一刻已有的 Star 不会补推。
+最常见的原因是仓库名写错，或服务器连不上 GitHub。v1.0.2 起 `/ghstar add` 会先做**网络自检**、再调 API 校验仓库是否存在，任一环节失败都会直接报错且不写入配置；若你旧版本添加过错误仓库，执行 `/ghstar del 错误仓库名` 后再重新添加即可。另外请注意：**建立基线后只推送「新增」的 Star**，加仓库那一刻已有的 Star 不会补推。
 
 **Q：QQ 官方机器人推送失败？**
 QQ 官方机器人平台不支持 AstrBot 的主动消息接口，请改用 NapCat / Lagrange 等 OneBot 适配器接入。
@@ -248,7 +338,7 @@ QQ 官方机器人平台不支持 AstrBot 的主动消息接口，请改用 NapC
 
 | 原则 | 落实情况 |
 | --- | --- |
-| 功能需经过测试 | 已编写离线测试（桩替 AstrBot / aiohttp），覆盖仓库名解析、HTTP 错误翻译、默认配置、`/ghstar add` 校验与拒绝、首次基线推送、Star/Fork/提交三类推送、**stargazers 端点受限时的降级与去重请求**、`starred_at` 排序、`list`/`diag` 文案、状态持久化往返、生命周期初始化与重复销毁、模板回退，**共 97 项断言全部通过** |
+| 功能需经过测试 | 已编写离线测试（桩替 AstrBot / aiohttp），覆盖仓库名解析、指令参数容错、HTTP 错误翻译、默认配置、`/ghstar add` 网络自检与拒绝、首次基线推送、Star/Fork/提交三类推送、**stargazers 端点受限时的降级与去重请求**、`starred_at` 排序、**镜像自动切换与 5xx 端点跳过**、Token 不透传镜像、`ping` 输出、`list`/`diag` 文案、状态持久化往返、生命周期初始化与重复销毁、模板回退，**共 170 项断言全部通过**；另以真实网络对直连与镜像做过联调验证 |
 | 需包含良好的注释 | 主程序含模块级说明、分区注释与逐方法 docstring |
 | 持久化数据存于 `data` 目录 | 状态写入 `data/plugin_data/astrbot_plugin_github_star_notifier/state.json`，并采用「临时文件 + `os.replace`」原子写入 |
 | 良好的错误处理机制 | 网络请求、JSON 解析、模板渲染、消息发送均有兜底；单仓库异常不影响其余仓库；插件不会因单次错误崩溃 |
@@ -271,7 +361,7 @@ python tests/test_offline.py
 测试会桩替 `astrbot` 与 `aiohttp` 模块，直接验证核心逻辑，输出形如：
 
 ```
-通过 97 项，失败 0 项
+通过 170 项，失败 0 项
 ```
 
 覆盖范围：
@@ -279,6 +369,8 @@ python tests/test_offline.py
 | 分组 | 内容 |
 | --- | --- |
 | 输入解析 | 仓库名多种写法归一化、HTTP 状态码中文翻译 |
+| 指令容错 | 跳过 `owner/repo` 占位符、完整链接、逗号分隔与多参数、反引号包裹、非法片段提示 |
+| 网络与镜像 | 全端点不可达时拒绝添加、直连失败自动切镜像、5xx 端点自动跳过、端点记忆与优先复用、`{url}` 模板式镜像编码、`auto_mirror` 开关、非法镜像过滤、Token 不透传镜像 |
 | 基线流程 | `/ghstar add` 校验与拒绝、首次基线推送、基线随实际值下修 |
 | 端点受限 | stargazers 404/403 时降级为「+N 位用户」且**仍正常推送**、失败后不再重复请求、`star_detail_ok` 标记 |
 | 增量推送 | Star / Fork / 提交三类推送、`starred_at` 排序取最新、Star 下降不推送 |

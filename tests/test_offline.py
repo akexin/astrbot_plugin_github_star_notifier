@@ -1,4 +1,4 @@
-"""v1.0.1 离线回归测试：桩掉 astrbot / aiohttp，直接验证核心逻辑。
+"""v1.0.2 离线回归测试：桩掉 astrbot / aiohttp，直接验证核心逻辑。
 
 运行方式（无需安装 AstrBot，仅需 Python 3.10+）：
 
@@ -6,9 +6,10 @@
 
 退出码为 0 表示全部通过。
 
-覆盖：仓库名解析、HTTP 错误翻译、首次基线推送、stargazers 受限降级、
-已知受限后不再重复请求、按 starred_at 排序、add 校验、Fork/提交推送、
-list/diag 文案、状态持久化、生命周期、轮询间隔下限。
+覆盖：仓库名解析、指令参数解析（占位符 / 多参数 / 完整链接）、HTTP 错误翻译、
+首次基线推送、stargazers 受限降级、已知受限后不再重复请求、按 starred_at 排序、
+add 校验、镜像自动切换与端点故障转移、Token 不透传镜像、ping 输出、
+Fork/提交推送、list/diag 文案、状态持久化、生命周期、轮询间隔下限。
 """
 
 import asyncio
@@ -152,10 +153,11 @@ make_module(
 sys.path.insert(0, PLUGIN_DIR)
 import main as P  # noqa: E402
 
-REPO = "owner/repo"
+REPO = "akiooo/mcd-save-master"
+"""测试用仓库名。刻意不使用 owner/repo —— 那是帮助文本里的占位符，会被指令层跳过。"""
 DEFAULT_INFO = {
     "full_name": REPO,
-    "html_url": "https://github.com/owner/repo",
+    "html_url": f"https://github.com/{REPO}",
     "default_branch": "main",
     "stargazers_count": 10,
     "forks_count": 1,
@@ -163,6 +165,10 @@ DEFAULT_INFO = {
 
 ROUTES: dict[str, tuple[int, object]] = {}
 CALLS: list[str] = []
+PROBE_CALLS: list[tuple[str, str]] = []
+NET = {"down": set(), "status": {}}
+"""NET['down'] 中的端点模拟「完全连不上」；NET['status'] 可指定端点返回的 HTTP
+状态码（例如 502 模拟镜像自身故障）。"""
 
 
 def set_route(path, status=200, data=None):
@@ -175,6 +181,17 @@ async def fake_request(path, params=None, accept=None):
         status, data = ROUTES[path]
         return status, json.loads(json.dumps(data)) if data is not None else None
     return 404, None
+
+
+async def fake_request_once(session, base, path, params=None, accept=None, timeout=None):
+    """模拟单个端点的请求：用于验证镜像探测与故障转移（不经过 _request 桩）。"""
+    PROBE_CALLS.append((base, path))
+    if base in NET["down"]:
+        return 0, None
+    if base in NET["status"]:
+        return NET["status"][base], None
+    status, data = ROUTES.get(path, (200, {"ok": True, "full_name": "probe"}))
+    return status, json.loads(json.dumps(data)) if data is not None else None
 
 
 class FakeContext:
@@ -202,14 +219,24 @@ def load_default_config():
     return cfg
 
 
-def new_plugin(config=None, group="default"):
+def new_plugin(config=None, group="default", reset_net=True):
     """新建插件实例。group 用于隔离数据目录，避免用例之间互相污染。"""
     DATA_ROOT["dir"] = os.path.join(ROOT, group)
     os.makedirs(DATA_ROOT["dir"], exist_ok=True)
+    if reset_net:
+        NET["down"] = set()
+        NET["status"] = {}
     ctx = FakeContext()
     plugin = P.GithubStarNotifier(ctx, config if config is not None else load_default_config())
     plugin._request = fake_request
+    plugin._request_once = fake_request_once
     return plugin, ctx
+
+
+def real_request(plugin):
+    """恢复未被桩替换的 _request，用于验证端点故障转移逻辑本身。"""
+    plugin.__dict__.pop("_request", None)
+    return plugin
 
 
 async def main():
@@ -253,7 +280,8 @@ async def main():
     set_route(f"/repos/{REPO}", 200, DEFAULT_INFO)
     before = len(ctx.sent)
     reply = await plugin._add_repo([REPO])
-    check(reply.startswith("✅"), f"add 成功回执：{reply!r}")
+    check(reply.startswith("🔍 网络检测"), f"add 回执以网络检测开场：{reply!r}")
+    check("✅ 已添加监控仓库：" in reply, "add 回执标明添加成功")
     check("Star 10" in reply, "add 回执包含当前 Star 数")
     check("已建立基线" in reply, "add 回执标明已建立基线")
     check(plugin.config["repositories"] == [REPO], "仓库已写入配置")
@@ -325,7 +353,7 @@ async def main():
     plugin4, ctx4 = new_plugin(group="t9")
     set_route("/repos/nope/missing", 404, None)
     reply = await plugin4._add_repo(["nope/missing"])
-    check(reply.startswith("❌"), f"拒绝并给出错误：{reply!r}")
+    check("❌ 无法添加 nope/missing" in reply, f"拒绝并给出错误：{reply!r}")
     check("仓库不存在" in reply, "错误说明为仓库不存在")
     check(plugin4.config["repositories"] == [], "失败时未写入配置")
     check(ctx4.sent == [], "失败时未推送")
@@ -467,7 +495,189 @@ async def main():
     check(await p14._check_all() == [], "无仓库时检查返回空列表")
     check("无，请使用 /ghstar add" in p14._list_text(), "list 提示如何添加")
     check("diag" in p14._help_text(), "帮助文本包含 diag 指令")
+    check("ping" in p14._help_text(), "帮助文本包含 ping 指令")
     check("add owner/repo" in (await p14._add_repo([])), "add 无参数时给出用法")
+    check("del owner/repo" in p14._del_repo([]), "del 无参数时给出用法")
+
+    print("== T20 指令解析：跳过占位符、支持链接与多参数 ==")
+    p15, ctx15 = new_plugin(group="t20")
+    repo, ignored, hit = p15._pick_repo(["owner/repo", "akiooo/mcd-save-master"])
+    check(repo == "akiooo/mcd-save-master", f"跳过占位符取真实仓库：{repo!r}")
+    check(hit is True, "识别出占位符")
+    check(any("owner/repo" in x for x in ignored), f"占位符列入忽略清单：{ignored}")
+    repo2, _, hit2 = p15._pick_repo(["owner/repo"])
+    check(repo2 == "" and hit2 is True, "仅占位符时不返回仓库")
+    repo3, _, _ = p15._pick_repo(["https://github.com/akiooo/mcd-save-master"])
+    check(repo3 == "akiooo/mcd-save-master", "支持直接粘贴完整链接")
+    repo4, _, _ = p15._pick_repo(["`akiooo/mcd-save-master`"])
+    check(repo4 == "akiooo/mcd-save-master", "剥离反引号等包裹字符")
+    repo5, _, _ = p15._pick_repo(["akiooo/mcd-save-master,akiooo/other"])
+    check(repo5 == "akiooo/mcd-save-master", "支持逗号分隔的多个参数")
+    repo6, _, _ = p15._pick_repo(["justone"])
+    check(repo6 == "", "非法片段不返回仓库")
+
+    set_route("/repos/akiooo/mcd-save-master", 200, {**DEFAULT_INFO, "stargazers_count": 7})
+    CALLS.clear()
+    reply = await p15._add_repo(["owner/repo", "akiooo/mcd-save-master"])
+    check("✅ 已添加监控仓库：akiooo/mcd-save-master" in reply, f"add 成功：{reply!r}")
+    check("已忽略无法识别的片段" in reply, "回执说明忽略了占位符")
+    check("❌" not in reply, "不应出现失败标记")
+    check(p15.config["repositories"] == ["akiooo/mcd-save-master"], "配置写入的是真实仓库")
+    check(p15._state["repos"].get("owner/repo") is None, "未创建占位符仓库的状态记录")
+    check("/repos/owner/repo" not in CALLS, "未对占位符发起请求")
+
+    print("== T21 全部端点不可达时拒绝添加 ==")
+    p16, ctx16 = new_plugin(group="t21")
+    NET["down"] = set(p16._api_bases())
+    reply = await p16._add_repo(["akiooo/demo"])
+    check(reply.startswith("🔍 网络检测"), f"先回报检测状态：{reply!r}")
+    check("均不可达" in reply, "说明全部端点不可达")
+    check("gh-proxy" in reply, "列出尝试过的镜像")
+    check("建议" in reply, "给出处理建议")
+    check(p16.config["repositories"] == [], "失败时不写配置")
+    check(ctx16.sent == [], "失败时不推送")
+
+    print("== T22 直连不可达时自动切换镜像 ==")
+    p17, ctx17 = new_plugin(group="t22")
+    p17._subscribe("t:GroupMessage:1")
+    NET["down"] = {P.API_BASE}
+    set_route("/repos/akiooo/demo2", 200, {**DEFAULT_INFO, "stargazers_count": 3})
+    reply = await p17._add_repo(["akiooo/demo2"])
+    check("已自动切换镜像" in reply, f"回报已自动切换：{reply!r}")
+    check("gh-proxy.com" in reply, "回报镜像名称")
+    check("✅ 已添加监控仓库：akiooo/demo2" in reply, "镜像可用时添加成功")
+    check(p17._state["api_base"].startswith("https://gh-proxy.com"), "记住可用镜像端点")
+    check(p17.config["repositories"] == ["akiooo/demo2"], "仓库已写入配置")
+    check(len(ctx17.sent) == 1, "基线推送恰为 1 条")
+    check("gh-proxy.com" in texts(ctx17)[0], "基线消息附带所用端点")
+
+    print("== T23 端点故障转移与端点记忆 ==")
+    p18, _ = new_plugin(group="t23")
+    real_request(p18)
+    bases = p18._api_bases()
+    NET["down"] = {bases[0], bases[1]}
+    set_route("/repos/akiooo/failover", 200, {"full_name": "akiooo/failover"})
+    status, data = await p18._request("/repos/akiooo/failover")
+    check(status == 200 and data["full_name"] == "akiooo/failover", "前两个端点失败后取到数据")
+    check(p18._state["api_base"] == bases[2], f"记住可用端点：{p18._state['api_base']}")
+    check(p18._ordered_bases()[0] == bases[2], "下次优先使用已记住的端点")
+    NET["down"] = set(p18._api_bases())
+    status2, data2 = await p18._request("/repos/x/y")
+    check(status2 == 0 and data2 is None, "全部端点失败返回 (0, None)")
+    check("网络" in P.GithubStarNotifier._describe_error(status2), "状态 0 的文案说明网络故障")
+
+    print("== T24 /ghstar ping 输出 ==")
+    p19, _ = new_plugin(group="t24")
+    NET["down"] = {P.API_BASE, p19._api_bases()[2]}
+    ping = await p19._ping_text()
+    check("连通性检测" in ping, "包含标题")
+    check("直连 api.github.com" in ping, "列出直连端点")
+    check("❌" in ping, "标记不可达端点")
+    check("✅" in ping, "标记可用端点")
+    check("当前使用：" in ping, "给出当前使用端点")
+    check("Token 透传给镜像：否" in ping, "默认不透传 Token")
+    check("自动镜像：开" in ping, "展示自动镜像开关")
+
+    print("== T25 Token 只发给官方端点 ==")
+    p20, _ = new_plugin(group="t25")
+    p20.config["github_token"] = "ghp_test_token"
+    check(
+        p20._headers_for(P.API_BASE).get("Authorization") == "Bearer ghp_test_token",
+        "直连携带 Token",
+    )
+    check(
+        "Authorization" not in p20._headers_for("https://gh-proxy.com/https://api.github.com"),
+        "镜像默认不携带 Token（避免泄露）",
+    )
+    p20.config["mirror_send_token"] = True
+    check(
+        "Authorization" in p20._headers_for("https://gh-proxy.com/https://api.github.com"),
+        "显式开启后才允许透传",
+    )
+    p20.config["mirror_send_token"] = False
+
+    print("== T26 镜像 URL 构造与端点开关 ==")
+    p21, _ = new_plugin(group="t26")
+    url, rest = p21._build_url(
+        "https://gh-proxy.com/https://api.github.com", "/repos/a/b", {"per_page": 100, "page": 3}
+    )
+    check(url == "https://gh-proxy.com/https://api.github.com/repos/a/b", f"前缀式拼接：{url}")
+    check(rest == {"per_page": 100, "page": 3}, "前缀式仍由请求库拼接查询参数")
+    url2, rest2 = p21._build_url(
+        "https://api.allorigins.win/raw?url={url}", "/repos/a/b", {"per_page": 5}
+    )
+    check(rest2 is None, "模板式自行编码查询参数")
+    check(
+        url2.startswith(
+            "https://api.allorigins.win/raw?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fa%2Fb"
+        ),
+        f"模板式编码目标地址：{url2}",
+    )
+    check("per_page%3D5" in url2, "查询参数一并编码进模板")
+    check(p21._api_bases()[0] == P.API_BASE, "默认直连优先")
+    check(len(p21._api_bases()) == 3, f"默认 1 直连 + 2 镜像：{p21._api_bases()}")
+    p21.config["auto_mirror"] = False
+    check(p21._api_bases() == [P.API_BASE], "关闭自动镜像后仅剩直连")
+    p21.config["auto_mirror"] = True
+    p21.config["custom_api_base"] = "https://my.proxy/https://api.github.com"
+    check(
+        p21._api_bases()[0] == "https://my.proxy/https://api.github.com",
+        "自定义地址优先级最高",
+    )
+    p21.config["github_api_mirrors"] = ["不是网址", "https://only.mirror/https://api.github.com"]
+    check(
+        p21._api_bases()
+        == ["https://my.proxy/https://api.github.com", P.API_BASE]
+        + ["https://only.mirror/https://api.github.com"],
+        f"非法镜像被忽略：{p21._api_bases()}",
+    )
+
+    print("== T27 list/diag 展示端点与镜像状态 ==")
+    p22, _ = new_plugin(group="t27")
+    check("尚未探测" in p22._list_text(), "未探测时提示执行 /ghstar ping")
+    diag = p22._diag_text()
+    check("自动镜像" in diag and "Token 透传镜像" in diag, "diag 展示镜像配置")
+    p22._state["api_base"] = "https://gh-proxy.com/https://api.github.com"
+    check("gh-proxy.com" in p22._list_text(), "list 显示当前端点")
+
+    print("== T28 仅填占位符时直接提示，不发请求 ==")
+    p24, ctx24 = new_plugin(group="t28")
+    set_route(f"/repos/{REPO}", 200, DEFAULT_INFO)
+    CALLS.clear()
+    reply = await p24._add_repo(["owner/repo"])
+    check(reply.startswith("⚠️"), f"提示而非报错：{reply!r}")
+    check("占位符" in reply, "说明 owner/repo 是示例占位符")
+    check("akiooo" not in reply, "不含无关内容")
+    check(p24.config["repositories"] == [], "不写配置")
+    check(CALLS == [], "未发起任何请求")
+    check(ctx24.sent == [], "未推送")
+    reply2 = p24._del_repo(["owner/repo"])
+    check(reply2.startswith("⚠️") and "占位符" in reply2, f"del 同样识别占位符：{reply2!r}")
+
+    print("== T29 5xx 端点故障自动跳过 ==")
+    p25, _ = new_plugin(group="t29")
+    real_request(p25)
+    bases = p25._api_bases()
+    NET["status"] = {bases[0]: 502, bases[1]: 520}
+    set_route("/repos/akiooo/fivexx", 200, {"full_name": "akiooo/fivexx"})
+    status, data = await p25._request("/repos/akiooo/fivexx")
+    check(status == 200 and data["full_name"] == "akiooo/fivexx", "5xx 端点被跳过后取到数据")
+    check(p25._state["api_base"] == bases[2], f"选中健康端点：{p25._state['api_base']}")
+    NET["status"] = dict.fromkeys(bases, 502)
+    status2, data2 = await p25._request("/repos/x/y")
+    check(status2 == 502 and data2 is None, f"全部 5xx 时返回真实状态码：{status2}")
+    check("502" in P.GithubStarNotifier._describe_error(status2), "错误文案含状态码")
+
+    print("== T30 5xx 端点不会被探测判为可用 ==")
+    p26, _ = new_plugin(group="t30")
+    p26.config["auto_mirror"] = False
+    NET["status"] = {P.API_BASE: 503}
+    results, ok = await p26._probe(all_bases=True)
+    check(ok == "", "5xx 端点不判为可用")
+    check(bool(results) and results[0]["ok"] is False, "探测结果标记为不可用")
+    ping2 = await p26._ping_text()
+    check("无可用端点" in ping2, "ping 报告无可用端点")
+    check("建议" in ping2, "ping 给出处理建议")
 
     print()
     print("=" * 56)

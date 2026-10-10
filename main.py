@@ -28,6 +28,26 @@ Star / Fork 的「新增数量」**只依赖** ``GET /repos/{owner}/{repo}`` 返
 「+N 位用户」，并且一旦确认不可用就停止重复请求，避免浪费 API 额度。
 **推送本身永远不会因为该限制而失效。**
 
+网络加速与镜像（v1.0.2 起）
+---------------------------
+部分服务器（尤其是国内主机）**无法访问 ``api.github.com``**，表现为
+``网络请求失败（无法连接 api.github.com）``。为此插件支持**多端点自动切换**：
+
+1. **自定义 API 地址**（``custom_api_base``，可选，优先级最高）
+2. **直连** ``https://api.github.com``
+3. **镜像**（``github_api_mirrors``，按配置顺序尝试）
+
+请求时按上述顺序逐个尝试，**第一个成功的端点会被记住**并在后续请求中优先使用，
+从而避免每次都先等直连超时。镜像支持两种写法：
+
+* 前缀式：``https://gh-proxy.com/https://api.github.com`` → 直接拼接路径
+* 模板式：``https://api.allorigins.win/raw?url={url}`` → ``{url}`` 替换为
+  完整且已 URL 编码的目标地址
+
+出于安全考虑，**默认不会把 GitHub Token 发送给第三方镜像**
+（``mirror_send_token`` 可显式打开）。使用 ``/ghstar ping`` 可手动检测
+全部端点的连通性与耗时，并把可用的最快端点设为当前使用端点。
+
 数据持久化
 ----------
 状态文件保存在 ``data/plugin_data/astrbot_plugin_github_star_notifier/state.json``，
@@ -42,7 +62,9 @@ import contextlib
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
 from astrbot.api import AstrBotConfig, logger
@@ -52,9 +74,46 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 PLUGIN_NAME = "astrbot_plugin_github_star_notifier"
-PLUGIN_VERSION = "v1.0.1"
+PLUGIN_VERSION = "v1.0.2"
 API_BASE = "https://api.github.com"
 CST = timezone(timedelta(hours=8))
+
+DEFAULT_API_MIRRORS = [
+    "https://gh-proxy.com/https://api.github.com",
+    "https://hk.gh-proxy.com/https://api.github.com",
+]
+"""默认镜像列表（2026-10-11 于真实网络实测通过）。
+
+* ``gh-proxy.com`` —— 实测最快（约 0.25s），前缀式代理，直接在其后拼接接口路径
+* ``hk.gh-proxy.com`` —— 同一家的备用节点，会 302 跳转一次作为兜底
+
+镜像均为第三方服务，随时可能失效，可在插件配置中自由增删。
+除前缀式外还支持模板式（``...?url={url}``），适合自建反向代理或通用代理，
+详见 ``_build_url``。
+"""
+
+PROBE_PATH = "/repos/octocat/Hello-World"
+"""连通性探测使用的公开仓库接口，稳定存在且无需鉴权。"""
+
+PLACEHOLDER_REPOS = {
+    "owner/repo",
+    "owner/name",
+    "owner/repository",
+    "user/repo",
+    "username/repo",
+    "your/repo",
+    "yourname/repo",
+    "org/repo",
+    "repo/name",
+    "name/repo",
+    "example/repo",
+    "xxx/xxx",
+    "test/test",
+    "用户名/仓库名",
+    "仓库/名称",
+    "作者/仓库",
+}
+"""帮助文本中的示例占位符。用户误把示例当参数时直接提示，不再发起无效请求。"""
 
 STARGAZER_PAGE_SIZE = 100
 """stargazers 接口单页容量。接口按 ``starred_at`` 升序返回，最新在最后一页。"""
@@ -197,7 +256,7 @@ class GithubStarNotifier(Star):
         """把各种写法的仓库地址统一成 ``owner/repo``，无法解析时返回空串。"""
         if not raw:
             return ""
-        text = str(raw).strip().strip("\"'").strip()
+        text = str(raw).strip().strip("\"'`（()）[]【】《》「」<>").strip()
         for prefix in (
             "https://github.com/",
             "http://github.com/",
@@ -215,6 +274,133 @@ class GithubStarNotifier(Star):
         if len(parts) < 2:
             return ""
         return f"{parts[0]}/{parts[1]}"
+
+    def _pick_repo(self, tokens: list[str]) -> tuple[str, list[str], bool]:
+        """从指令参数中挑出真实仓库名。
+
+        GitHub 的帮助文本写的是 ``/ghstar add owner/repo``，不少用户会把
+        ``owner/repo`` 一起敲进去（``/ghstar add owner/repo akiooo/mcd-save-master``），
+        导致插件去请求并不存在的占位符仓库。此处会：
+
+        * 按空白 / 逗号 / 分号切分所有参数
+        * 跳过占位符（``owner/repo`` 等）与非法片段
+        * 返回第一个**看起来真实**的仓库名
+
+        返回 ``(仓库名, 被忽略的片段列表, 是否命中占位符)``。
+        """
+        pieces: list[str] = []
+        for token in tokens or []:
+            pieces.extend(p for p in re.split(r"[\s,;，；]+", str(token)) if p.strip())
+
+        repo = ""
+        ignored: list[str] = []
+        placeholder_hit = False
+        for piece in pieces:
+            piece = piece.strip()
+            normalized = self._normalize_repo(piece)
+            if not normalized:
+                ignored.append(piece)
+                continue
+            if normalized.lower() in PLACEHOLDER_REPOS:
+                placeholder_hit = True
+                ignored.append(piece)
+                continue
+            if not repo:
+                repo = normalized
+            else:
+                ignored.append(piece)
+        return repo, ignored, placeholder_hit
+
+    # ------------------------------------------------------------------ #
+    # API 端点（直连 / 自定义 / 镜像）
+    # ------------------------------------------------------------------ #
+    def _mirror_list(self) -> list[str]:
+        """读取镜像列表；配置中缺失该键时回退到内置默认镜像。"""
+        raw = self.config.get("github_api_mirrors")
+        if raw is None:
+            raw = list(DEFAULT_API_MIRRORS)
+        if isinstance(raw, str):
+            raw = re.split(r"[\s,;\n]+", raw)
+        result: list[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                url = str(item or "").strip().rstrip("/") or ""
+                if not url.startswith("http") or url == API_BASE:
+                    continue
+                if url not in result:
+                    result.append(url)
+        return result
+
+    def _api_bases(self) -> list[str]:
+        """按优先级返回候选端点：自定义 → 直连 → 镜像。"""
+        bases: list[str] = []
+        custom = self._conf_str("custom_api_base").rstrip("/")
+        if custom.startswith("http"):
+            bases.append(custom)
+        bases.append(API_BASE)
+        if self._conf_bool("auto_mirror", True):
+            bases.extend(b for b in self._mirror_list() if b not in bases)
+        return bases
+
+    def _ordered_bases(self) -> list[str]:
+        """把上次成功的端点提到最前，避免每次都先等直连超时。"""
+        bases = self._api_bases()
+        known = str(self._state.get("api_base") or "")
+        if known and known in bases:
+            return [known] + [b for b in bases if b != known]
+        return bases
+
+    @staticmethod
+    def _endpoint_label(base: str) -> str:
+        """端点的可读名称。"""
+        if not base:
+            return "未知端点"
+        if base == API_BASE:
+            return "直连 api.github.com"
+        host = urlsplit(base).netloc or base
+        return f"{host}（镜像）"
+
+    def _remember_base(self, base: str) -> None:
+        if base and self._state.get("api_base") != base:
+            self._state["api_base"] = base
+            self._state["api_base_at"] = self._now()
+            logger.info(f"[{PLUGIN_NAME}] 当前使用 API 端点：{self._endpoint_label(base)}")
+
+    def _current_endpoint(self) -> str:
+        return str(self._state.get("api_base") or "")
+
+    def _token_allowed(self, base: str) -> bool:
+        """是否允许把 Token 发给该端点。
+
+        非官方端点一律不发，避免把个人访问令牌泄露给第三方镜像；
+        确需透传时可在配置中打开 ``mirror_send_token``。
+        """
+        if base.startswith(API_BASE):
+            return True
+        return self._conf_bool("mirror_send_token")
+
+    def _headers_for(self, base: str, accept: str | None = None) -> dict:
+        headers = {
+            "Accept": accept or "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        token = self._conf_str("github_token")
+        if token and self._token_allowed(base):
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _build_url(self, base: str, path: str, params: dict | None) -> tuple[str, dict | None]:
+        """构造请求地址，兼容前缀式与 ``{url}`` 模板式镜像。
+
+        返回 ``(url, 仍需交给 aiohttp 拼接的查询参数)``。模板式镜像会把查询
+        参数编码进 URL，因此第二个元素为 ``None``。
+        """
+        target = f"{API_BASE}{path}"
+        if params:
+            target = f"{target}?{urlencode({k: str(v) for k, v in params.items()})}"
+        if "{url}" in base:
+            return base.replace("{url}", quote(target, safe="")), None
+        return f"{base}{path}", params
 
     # ------------------------------------------------------------------ #
     # 状态持久化
@@ -317,6 +503,7 @@ class GithubStarNotifier(Star):
         record["url"] = html_url
         record["last_success_at"] = self._now()
         record["last_error"] = ""
+        record["endpoint"] = self._endpoint_label(self._current_endpoint() or API_BASE)
 
         await self._handle_stars(repo, record, first_run, prev_stars, stars, full_name, html_url)
         await self._handle_forks(repo, record, prev_forks, forks, full_name, html_url)
@@ -343,9 +530,11 @@ class GithubStarNotifier(Star):
             record["baseline_at"] = self._now()
             # 首次建立基线时默认推送一条，便于用户当场确认推送链路是否打通。
             if self._conf_bool("notify_on_first_run", True):
+                endpoint = self._endpoint_label(self._current_endpoint() or API_BASE)
                 text = (
                     f"👀 已开始监控 {full_name}\n"
                     f"当前 Star：{stars}　Fork：{record.get('forks', 0)}\n"
+                    f"API 端点：{endpoint}\n"
                     f"此后新增 Star 会即时推送到本会话。\n"
                     f"{html_url}"
                 )
@@ -464,19 +653,59 @@ class GithubStarNotifier(Star):
         path: str,
         params: dict | None = None,
         accept: str | None = None,
+        bases: list[str] | None = None,
     ) -> tuple[int, object | None]:
-        """发起 GitHub REST 请求，返回 ``(HTTP 状态码, JSON)``；网络异常返回 ``(0, None)``。"""
+        """发起 GitHub REST 请求，返回 ``(HTTP 状态码, JSON)``。
+
+        依次尝试候选端点（自定义 → 直连 → 镜像），**遇到网络层失败（状态码 0）
+        才切换到下一个端点**；只要能拿到 HTTP 响应就认定该端点可用并记住它。
+        全部端点都连不上时返回 ``(0, None)``。
+        """
         session = self._ensure_session()
-        headers = {
-            "Accept": accept or "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        token = self._conf_str("github_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        candidates = list(bases) if bases else self._ordered_bases()
+        failed: list[str] = []
+        last_status = 0
+
+        for base in candidates:
+            status, data = await self._request_once(session, base, path, params, accept)
+            if 0 < status < 500:
+                # 拿到有效的 HTTP 业务响应即认定该端点可用。
+                self._remember_base(base)
+                return status, data
+            if status:
+                # 5xx：端点自身故障（镜像返回 500/502/520 等），换下一个端点重试。
+                last_status = status
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 端点 {self._endpoint_label(base)} 返回 HTTP {status}，"
+                    "自动尝试下一个端点。"
+                )
+            failed.append(self._endpoint_label(base))
+
+        if failed:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 所有 API 端点均不可用（{path}）：{'、'.join(failed)}。"
+                "可使用 /ghstar ping 检测连通性，或在配置中更换镜像。"
+            )
+        return last_status, None
+
+    async def _request_once(
+        self,
+        session: aiohttp.ClientSession,
+        base: str,
+        path: str,
+        params: dict | None = None,
+        accept: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[int, object | None]:
+        """向单个端点发起请求。网络异常 / 响应非 JSON 时返回 ``(0, None)``。"""
+        url, rest_params = self._build_url(base, path, params)
+        headers = self._headers_for(base, accept)
+        kwargs: dict = {"params": rest_params, "headers": headers}
+        if timeout:
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
         try:
-            async with session.get(f"{API_BASE}{path}", params=params, headers=headers) as resp:
+            async with session.get(url, **kwargs) as resp:
                 status = resp.status
                 if status == 403:
                     remaining = resp.headers.get("X-RateLimit-Remaining", "?")
@@ -491,8 +720,95 @@ class GithubStarNotifier(Star):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[{PLUGIN_NAME}] 请求 GitHub 失败（{path}）：{exc}")
+            logger.warning(
+                f"[{PLUGIN_NAME}] 请求失败（{self._endpoint_label(base)}，{path}）：{exc}"
+            )
             return 0, None
+
+    # ------------------------------------------------------------------ #
+    # 连通性检测
+    # ------------------------------------------------------------------ #
+    async def _probe(self, all_bases: bool = False, timeout: float = 8.0) -> tuple[list[dict], str]:
+        """逐个探测候选端点，返回 ``(探测结果列表, 第一个可用端点)``。
+
+        ``all_bases=False`` 时命中第一个可用端点即停止（用于 add 流程，避免等待）；
+        ``all_bases=True`` 时探测全部端点（用于 /ghstar ping）。
+        """
+        session = self._ensure_session()
+        results: list[dict] = []
+        first_ok = ""
+        for base in self._api_bases():
+            start = time.perf_counter()
+            status, _ = await self._request_once(session, base, PROBE_PATH, timeout=timeout)
+            elapsed = max(1, int((time.perf_counter() - start) * 1000))
+            ok = 0 < status < 500
+            results.append({"base": base, "status": status, "ms": elapsed, "ok": ok})
+            if ok:
+                if not first_ok:
+                    first_ok = base
+                if not all_bases:
+                    break
+        if first_ok:
+            self._remember_base(first_ok)
+        return results, first_ok
+
+    @staticmethod
+    def _probe_lines(results: list[dict], first: int = 1) -> list[str]:
+        lines: list[str] = []
+        for index, item in enumerate(results, first):
+            if item["ok"]:
+                lines.append(
+                    f"  {index}. ✅ {GithubStarNotifier._endpoint_label(item['base'])}"
+                    f"　{item['ms']} ms"
+                )
+            else:
+                lines.append(
+                    f"  {index}. ❌ {GithubStarNotifier._endpoint_label(item['base'])}　连接失败"
+                )
+        return lines
+
+    def _probe_headline(self, results: list[dict], ok_base: str) -> str:
+        """把探测结果压成一行状态摘要。"""
+        if not ok_base:
+            return "🔍 网络检测：❌ GitHub API 在全部端点上均不可达"
+        label = self._endpoint_label(ok_base)
+        ms = next((r["ms"] for r in results if r["base"] == ok_base), 0)
+        if ok_base == API_BASE:
+            return f"🔍 网络检测：✅ 直连 api.github.com　{ms} ms"
+        direct_failed = any(not r["ok"] for r in results if r["base"] != ok_base)
+        if direct_failed:
+            return f"🔍 网络检测：⚠️ 直连不可用，已自动切换镜像 ✅ {label}　{ms} ms"
+        return f"🔍 网络检测：✅ {label}　{ms} ms"
+
+    @staticmethod
+    def _mirror_hint() -> str:
+        return (
+            "建议：\n"
+            "  ① 检查服务器能否访问外网（可先 ping api.github.com）；\n"
+            "  ② 在插件配置的「GitHub API 镜像」中增删镜像地址；\n"
+            "  ③ 若有自建反向代理，填入「自定义 API 地址」。"
+        )
+
+    async def _ping_text(self) -> str:
+        """探测全部端点并输出耗时，把可用的最快端点设为当前端点。"""
+        results, ok = await self._probe(all_bases=True, timeout=8.0)
+        lines = [f"🌐 GitHub API 连通性检测　{PLUGIN_VERSION}"]
+        lines.extend(self._probe_lines(results))
+        lines.append("")
+        if ok:
+            lines.append(f"当前使用：{self._endpoint_label(ok)}")
+            if ok != API_BASE:
+                lines.append("（直连不可用 → 已自动切换镜像加速；镜像为第三方服务，未发送 Token）")
+        else:
+            lines.append("当前使用：无可用端点")
+            lines.append(self._mirror_hint())
+        lines.append("")
+        lines.append(
+            f"自动镜像：{'开' if self._conf_bool('auto_mirror', True) else '关'}"
+            f"　镜像数量：{len(self._mirror_list())}"
+            f"　Token 透传给镜像：{'是（存在泄露风险）' if self._conf_bool('mirror_send_token') else '否'}"
+        )
+        return "\n".join(lines)
 
     async def _gh_get(
         self,
@@ -508,7 +824,7 @@ class GithubStarNotifier(Star):
     def _describe_error(status: int, path: str = "") -> str:
         """把 HTTP 状态码翻译成用户可读的中文说明。"""
         if status == 0:
-            return "网络请求失败（无法连接 api.github.com）"
+            return "网络请求失败（直连与镜像均无法连接 GitHub API，可用 /ghstar ping 检测）"
         if status == 401:
             return "Token 无效或已过期，请检查 github_token 配置"
         if status == 403:
@@ -724,7 +1040,7 @@ class GithubStarNotifier(Star):
     async def ghstar(self, event: AstrMessageEvent):
         """GitHub 仓库动态推送管理指令（仅管理员）。
 
-        用法：/ghstar [sub|unsub|add|del|list|check|diag|test|help]
+        用法：/ghstar [sub|unsub|add|del|list|check|ping|diag|test|help]
         """
         args = self._parse_args(event, "ghstar")
         sub = args[0].lower() if args else "help"
@@ -758,6 +1074,11 @@ class GithubStarNotifier(Star):
             yield event.plain_result(self._diag_text())
             return
 
+        if sub in ("ping", "net", "network", "网络", "连通性"):
+            yield event.plain_result("⏳ 正在检测 GitHub API 连通性（直连与镜像）…")
+            yield event.plain_result(await self._ping_text())
+            return
+
         if sub in ("check", "检查", "刷新"):
             yield event.plain_result("⏳ 正在检查所有监控仓库，请稍候…")
             summaries = await self._check_all()
@@ -765,9 +1086,13 @@ class GithubStarNotifier(Star):
                 yield event.plain_result("ℹ️ 尚未配置监控仓库，请先使用 /ghstar add owner/repo。")
                 return
             ok = sum(1 for line in summaries if line.startswith("✅"))
-            yield event.plain_result(
-                "\n".join(summaries) + f"\n\n检查完成：{len(summaries)} 个仓库，{ok} 个正常。"
-            )
+            text = "\n".join(summaries) + f"\n\n检查完成：{len(summaries)} 个仓库，{ok} 个正常。"
+            if ok == 0 and any("网络" in line for line in summaries):
+                text += (
+                    "\n\n⚠️ 存在网络故障，请用 /ghstar ping 检测连通性；"
+                    "如直连不可用，插件会自动尝试镜像（可在配置中增删镜像地址）。"
+                )
+            yield event.plain_result(text)
             return
 
         if sub in ("test", "测试"):
@@ -848,12 +1173,23 @@ class GithubStarNotifier(Star):
         return "✅ 已取消订阅。" if removed else "ℹ️ 当前会话并未订阅。"
 
     async def _add_repo(self, rest: list[str]) -> str:
-        """添加监控仓库：先校验仓库是否存在，再立即建立基线并回报。"""
-        if not rest:
-            return "用法：/ghstar add owner/repo"
-        repo = self._normalize_repo(rest[0])
+        """添加监控仓库：先检测网络连通性，再校验仓库是否存在，最后建立基线。"""
+        repo, ignored, placeholder_hit = self._pick_repo(rest)
         if not repo:
-            return f"⚠️ 无法解析仓库名：{rest[0]}，请使用 owner/repo 格式（如 akexin/astrbot_plugin_github_star_notifier）。"
+            if placeholder_hit:
+                return (
+                    "⚠️ owner/repo 只是帮助里的示例占位符，不是真实仓库。\n"
+                    "用法：/ghstar add 用户名/仓库名\n"
+                    f"例如：/ghstar add akexin/{PLUGIN_NAME}\n"
+                    "也支持直接粘贴链接：/ghstar add https://github.com/用户名/仓库名"
+                )
+            if ignored:
+                return (
+                    f"⚠️ 无法解析仓库名：{'、'.join(ignored)}\n"
+                    "用法：/ghstar add owner/repo\n"
+                    f"例如：/ghstar add akexin/{PLUGIN_NAME}"
+                )
+            return f"用法：/ghstar add owner/repo\n例如：/ghstar add akexin/{PLUGIN_NAME}"
 
         repos = self.config.get("repositories") or []
         if not isinstance(repos, list):
@@ -861,26 +1197,42 @@ class GithubStarNotifier(Star):
         if any(self._normalize_repo(str(item)) == repo for item in repos):
             return f"ℹ️ 该仓库已在监控列表中：{repo}"
 
-        # 先探测仓库是否存在，避免把占位符或拼错的仓库名写进配置后静默失效。
+        # ① 先检测网络：直连不可达时自动切换镜像，并把检测状态回报给用户。
+        results, ok_base = await self._probe()
+        head = self._probe_headline(results, ok_base)
+        if not ok_base:
+            return (
+                f"{head}\n" + "\n".join(self._probe_lines(results)) + "\n\n" + self._mirror_hint()
+            )
+
+        # ② 再校验仓库是否存在，避免把占位符或拼错的仓库名写进配置后静默失效。
         status, info = await self._request(f"/repos/{repo}")
         if status != 200 or not isinstance(info, dict):
-            return f"❌ 无法添加 {repo}：{self._describe_error(status, f'/repos/{repo}')}"
+            return f"{head}\n❌ 无法添加 {repo}：{self._describe_error(status, f'/repos/{repo}')}"
 
         repos.append(repo)
         self.config["repositories"] = repos
         self._save_config()
+        self._save_state()
 
-        # 立即建立基线（并默认推送一条「已开始监控」），让用户当场看到效果。
+        # ③ 立即建立基线（并默认推送一条「已开始监控」），让用户当场看到效果。
         summary = await self._check_repo(repo, info=info)
         self._save_state()
-        return f"✅ 已添加监控仓库：{repo}\n{summary}"
+
+        note = f"\n（已忽略无法识别的片段：{'、'.join(ignored)}）" if ignored else ""
+        return f"{head}\n✅ 已添加监控仓库：{repo}{note}\n{summary}"
 
     def _del_repo(self, rest: list[str]) -> str:
-        if not rest:
-            return "用法：/ghstar del owner/repo"
-        repo = self._normalize_repo(rest[0])
+        repo, ignored, placeholder_hit = self._pick_repo(rest)
         if not repo:
-            return f"⚠️ 无法解析仓库名：{rest[0]}。"
+            if placeholder_hit:
+                return (
+                    "⚠️ owner/repo 只是示例占位符，请填写真实仓库名。\n"
+                    "用法：/ghstar del 用户名/仓库名"
+                )
+            if ignored:
+                return f"⚠️ 无法解析仓库名：{'、'.join(ignored)}。\n用法：/ghstar del owner/repo"
+            return "用法：/ghstar del owner/repo\n例如：/ghstar del akexin/astrbot_plugin_github_star_notifier"
 
         repos = self.config.get("repositories") or []
         if not isinstance(repos, list):
@@ -924,6 +1276,11 @@ class GithubStarNotifier(Star):
         lines.append(
             f"GitHub Token：{'已配置' if self._conf_str('github_token') else '未配置（速率受限）'}"
         )
+        endpoint = self._current_endpoint()
+        lines.append(
+            "API 端点："
+            + (self._endpoint_label(endpoint) if endpoint else "— 尚未探测（可执行 /ghstar ping）")
+        )
         lines.append("")
         if repos:
             lines.append(f"监控仓库（{len(repos)}）：")
@@ -950,6 +1307,16 @@ class GithubStarNotifier(Star):
         lines.append(
             f"GitHub Token：{'✅ 已配置' if self._conf_str('github_token') else '⛔ 未配置'}"
         )
+        endpoint = self._current_endpoint()
+        lines.append(
+            "API 端点："
+            + (self._endpoint_label(endpoint) if endpoint else "— 尚未探测（可执行 /ghstar ping）")
+        )
+        lines.append(
+            f"自动镜像：{'开' if self._conf_bool('auto_mirror', True) else '关'}"
+            f"（{len(self._mirror_list())} 个）"
+            f"　Token 透传镜像：{'是' if self._conf_bool('mirror_send_token') else '否'}"
+        )
         lines.append(f"推送目标：{len(sessions)} 个会话")
         lines.append(f"数据文件：{self.state_file}")
         lines.append("")
@@ -972,6 +1339,8 @@ class GithubStarNotifier(Star):
                 f"（累计 {record.get('checks') or 0} 次）"
             )
             lines.append(f"　最近成功：{record.get('last_success_at') or '—'}")
+            if record.get("endpoint"):
+                lines.append(f"　所用端点：{record['endpoint']}")
             if record.get("last_error"):
                 lines.append(f"　最近错误：❌ {record['last_error']}")
 
@@ -995,13 +1364,17 @@ class GithubStarNotifier(Star):
             "管理员指令：\n"
             "/ghstar sub　　　在当前会话订阅推送\n"
             "/ghstar unsub　　取消当前会话订阅\n"
-            "/ghstar add owner/repo　添加监控仓库（立即校验并建立基线）\n"
+            "/ghstar add owner/repo　添加监控仓库（检测网络 → 校验仓库 → 建立基线）\n"
             "/ghstar del owner/repo　移除监控仓库\n"
             "/ghstar list　　 查看当前状态\n"
             "/ghstar check　　立即检查一次\n"
+            "/ghstar ping　　 检测 GitHub API 连通性（直连与镜像）\n"
             "/ghstar diag　　 查看推送进度诊断\n"
             "/ghstar test　　 发送测试消息\n"
             "/ghstar help　　 显示本帮助\n"
+            "\n"
+            "添加仓库时可只写 owner/repo，也可直接粘贴完整链接；\n"
+            "若直连 api.github.com 不通，插件会自动切换到可用镜像加速。\n"
             "\n"
             "群成员指令：\n"
             "/ghsub　 订阅（需在配置中开启「允许群成员订阅」）\n"

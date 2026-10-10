@@ -9,14 +9,41 @@
     "description": "监控的 GitHub 仓库列表",
     "type": "list",
     "default": [],
-    "hint": "每项填写 owner/repo，例如 akexin/astrbot_plugin_github_star_notifier；也可以在群内用 /ghstar add owner/repo 添加（会自动校验仓库是否存在）。"
+    "hint": "每项填写「用户名/仓库名」，例如 akexin/astrbot_plugin_github_star_notifier（owner/repo 只是示例写法，请替换为真实名称）。也可以直接在群内用 /ghstar add 真实用户名/仓库名 添加，插件会自动跳过示例占位符、检测网络并校验仓库是否存在。"
   },
   "github_token": {
     "description": "GitHub 个人访问令牌（可选）",
     "type": "string",
     "default": "",
     "secret": true,
-    "hint": "填写后 API 速率上限由 60 次/小时提升至 5000 次/小时。公开仓库只需勾选 public_repo 权限即可，建议使用 Fine-grained Token 并仅授予只读权限。"
+    "hint": "填写后 API 速率上限由 60 次/小时提升至 5000 次/小时。公开仓库只需勾选 public_repo 权限即可，建议使用 Fine-grained Token 并仅授予只读权限。注意：为避免泄露，Token 默认只发给官方 api.github.com，不会发送给第三方镜像。"
+  },
+  "auto_mirror": {
+    "description": "直连失败时自动切换 GitHub 镜像加速",
+    "type": "bool",
+    "default": true,
+    "hint": "建议保持开启。部分服务器（尤其国内主机）无法访问 api.github.com，开启后会按「自定义地址 → 直连 → 镜像」的顺序自动尝试，并把第一个可用的端点记录下来复用。使用 /ghstar ping 可查看各端点耗时。"
+  },
+  "github_api_mirrors": {
+    "description": "GitHub API 镜像地址（按顺序尝试）",
+    "type": "list",
+    "default": [
+      "https://gh-proxy.com/https://api.github.com",
+      "https://hk.gh-proxy.com/https://api.github.com"
+    ],
+    "hint": "两种写法：① 前缀式 —— https://gh-proxy.com/https://api.github.com（直接在其后拼接接口路径，默认两项均为 2026-10-11 实测可用）；② 模板式 —— https://api.allorigins.win/raw?url={url}（{url} 会替换为完整且已编码的地址，适合自建反向代理或通用代理）。镜像均为第三方服务，可能失效，可自由增删。"
+  },
+  "custom_api_base": {
+    "description": "自定义 API 地址（可选，优先级最高）",
+    "type": "string",
+    "default": "",
+    "hint": "如有自建反向代理，填写其地址（写法同上，例如 https://gh.example.com/https://api.github.com）。填写后会最先尝试该地址。"
+  },
+  "mirror_send_token": {
+    "description": "允许把 GitHub Token 发送给第三方镜像",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。开启后令牌会随请求发送给镜像服务商，存在泄露风险，仅在完全信任该镜像（例如自建）时才打开。关闭时镜像请求为匿名访问，速率上限 60 次/小时。"
   },
   "poll_interval": {
     "description": "轮询间隔（秒）",
